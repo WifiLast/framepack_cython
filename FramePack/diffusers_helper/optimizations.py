@@ -5,6 +5,7 @@ from typing import Iterable, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 
 _SUPPORTED_QUANT_MODULES = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)
@@ -238,6 +239,65 @@ def maybe_compile_module(module: nn.Module, mode: str = "reduce-overhead", dynam
     except Exception as exc:  # pragma: no cover - compilation failures should not break execution
         print(f"torch.compile failed for {module.__class__.__name__}: {exc}")
         return module
+
+
+def _init_dist_if_needed() -> bool:
+    if not dist.is_available():
+        return False
+    if dist.is_initialized():
+        return True
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    try:
+        dist.init_process_group(backend=backend, rank=0, world_size=1)
+    except Exception as exc:  # pragma: no cover - fallback path
+        print(f"Failed to initialize process group for FSDP: {exc}")
+        return False
+    return True
+
+
+def maybe_wrap_with_fsdp(module: nn.Module, compute_dtype: torch.dtype = torch.float16) -> nn.Module:
+    use_fsdp = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
+    if not use_fsdp:
+        return module
+
+    if not _init_dist_if_needed():
+        return module
+
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload, MixedPrecision
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    except Exception as exc:  # pragma: no cover - environment dependent
+        print(f"torch.distributed.fsdp not available: {exc}")
+        return module
+
+    min_params = int(os.environ.get("FRAMEPACK_FSDP_MIN_PARAMS", 5_000_000))
+    auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=max(1, min_params))
+    cpu_offload = CPUOffload(offload_params=True)
+    mixed_precision = MixedPrecision(
+        param_dtype=compute_dtype,
+        reduce_dtype=compute_dtype,
+        buffer_dtype=compute_dtype,
+    )
+
+    fsdp_kwargs = dict(
+        cpu_offload=cpu_offload,
+        mixed_precision=mixed_precision,
+        auto_wrap_policy=auto_wrap_policy,
+        use_orig_params=True,
+    )
+
+    nvme_dir = os.environ.get("FRAMEPACK_FSDP_NVME_PATH", "").strip()
+    if nvme_dir:
+        try:
+            from torch.distributed.fsdp.offload import OffloadConfig
+
+            fsdp_kwargs["offload_config"] = OffloadConfig(offload_dir=nvme_dir)
+            print(f"Enabled NVMe param offload at {nvme_dir}.")
+        except Exception as exc:  # pragma: no cover - optional feature
+            print(f"NVMe offload unavailable: {exc}")
+
+    print("Wrapping module with FSDP (CPU/NVMe offload).")
+    return FSDP(module, **fsdp_kwargs)
 
 
 class AdaptiveLatentWindowController:

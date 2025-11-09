@@ -15,7 +15,15 @@ import math
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
-from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+from transformers import (
+    LlamaModel,
+    CLIPTextModel,
+    LlamaTokenizerFast,
+    CLIPTokenizer,
+    SiglipImageProcessor,
+    SiglipVisionModel,
+    BitsAndBytesConfig,
+)
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
@@ -23,7 +31,6 @@ from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
-from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 from diffusers_helper.optimizations import (
@@ -31,6 +38,7 @@ from diffusers_helper.optimizations import (
     apply_int_nbit_quantization,
     enforce_low_precision,
     maybe_compile_module,
+    maybe_wrap_with_fsdp,
     prune_transformer_layers,
 )
 
@@ -61,9 +69,41 @@ print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 MODEL_COMPUTE_DTYPE = torch.float16
 QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
+USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
+USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
+bnb_config = None
+bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+if USE_BITSANDBYTES:
+    load_in_4bit = os.environ.get("FRAMEPACK_BNB_LOAD_IN_4BIT", "0") == "1"
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=not load_in_4bit,
+        load_in_4bit=load_in_4bit,
+        llm_int8_enable_fp32_cpu_offload=os.environ.get("FRAMEPACK_BNB_CPU_OFFLOAD", "1") == "1",
+        bnb_4bit_compute_dtype=MODEL_COMPUTE_DTYPE,
+        bnb_4bit_use_double_quant=os.environ.get("FRAMEPACK_BNB_DOUBLE_QUANT", "1") == "1",
+    )
+    print(f'BitsAndBytes quantization enabled ({"4bit" if load_in_4bit else "8bit"}) with device_map={bnb_device_map}.')
+
+text_encoder_kwargs = dict(torch_dtype=torch.float16)
+clip_text_kwargs = dict(torch_dtype=torch.float16)
+if USE_BITSANDBYTES:
+    text_encoder_kwargs = dict(
+        quantization_config=bnb_config,
+        device_map=bnb_device_map,
+        low_cpu_mem_usage=True,
+    )
+    clip_text_kwargs = dict(
+        quantization_config=bnb_config,
+        device_map=bnb_device_map,
+        low_cpu_mem_usage=True,
+    )
+
+text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', **text_encoder_kwargs)
+text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', **clip_text_kwargs)
+if not USE_BITSANDBYTES:
+    text_encoder = text_encoder.cpu()
+    text_encoder_2 = text_encoder_2.cpu()
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
 vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
@@ -71,26 +111,33 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanV
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+transformer_core = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
 
 vae.eval()
 text_encoder.eval()
 text_encoder_2.eval()
 image_encoder.eval()
-transformer.eval()
+transformer_core.eval()
 
-for module in (text_encoder, text_encoder_2, vae, image_encoder, transformer):
+manual_quant_targets = [vae, image_encoder, transformer_core]
+if not USE_BITSANDBYTES:
+    manual_quant_targets.extend([text_encoder, text_encoder_2])
+
+for module in manual_quant_targets:
     apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
     enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
 
 prune_transformer_layers(
-    transformer,
+    transformer_core,
     dual_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_DUAL_RATIO", 0.5)),
     single_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_SINGLE_RATIO", 0.5)),
 )
-transformer.enable_gradient_checkpointing()
-transformer.high_quality_fp32_output_for_inference = False
+transformer_core.enable_gradient_checkpointing()
+transformer_core.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = False')
+
+transformer = maybe_wrap_with_fsdp(transformer_core, compute_dtype=MODEL_COMPUTE_DTYPE)
+TRANSFORMER_BACKBONE = transformer_core
 
 if not high_vram:
     vae.enable_slicing()
@@ -104,15 +151,19 @@ transformer.requires_grad_(False)
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-    DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+    if not USE_FSDP:
+        DynamicSwapInstaller.install_model(transformer, device=gpu)
+    if not USE_BITSANDBYTES:
+        DynamicSwapInstaller.install_model(text_encoder, device=gpu)
 else:
-    text_encoder.to(gpu)
-    text_encoder_2.to(gpu)
+    if not USE_BITSANDBYTES:
+        text_encoder.to(gpu)
+        text_encoder_2.to(gpu)
     image_encoder.to(gpu)
     vae.to(gpu)
-    transformer.to(gpu)
-    transformer = maybe_compile_module(transformer, mode="reduce-overhead", dynamic=True)
+    if not USE_FSDP:
+        transformer.to(gpu)
+        transformer = maybe_compile_module(transformer, mode="reduce-overhead", dynamic=True)
     transformer.requires_grad_(False)
 
 stream = AsyncStream()
@@ -129,21 +180,25 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
+    transformer_backbone = getattr(transformer, "module", None)
+    if transformer_backbone is None:
+        transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer)
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
         # Clean GPU
         if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+            modules_to_unload = [image_encoder, vae, transformer]
+            if not USE_BITSANDBYTES:
+                modules_to_unload.extend([text_encoder, text_encoder_2])
+            unload_complete_models(*modules_to_unload)
 
         # Text encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
-        if not high_vram:
+        if not high_vram and not USE_BITSANDBYTES:
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
@@ -244,14 +299,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            if not high_vram:
+            if not high_vram and not USE_FSDP:
                 unload_complete_models()
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps)
             else:
-                transformer.initialize_teacache(enable_teacache=False)
+                transformer_backbone.initialize_teacache(enable_teacache=False)
 
             def callback(d):
                 preview = d['denoised']
@@ -308,7 +363,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
-            if not high_vram:
+            if not high_vram and not USE_FSDP:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
                 load_model_as_complete(vae, target_device=gpu)
 
@@ -340,9 +395,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         traceback.print_exc()
 
         if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+            modules_to_unload = [image_encoder, vae, transformer]
+            if not USE_BITSANDBYTES:
+                modules_to_unload.extend([text_encoder, text_encoder_2])
+            unload_complete_models(*modules_to_unload)
 
     stream.output_queue.push(('end', None))
     return
