@@ -47,7 +47,7 @@ def sample_hunyuan(
         negative_prompt_embeds=None,
         negative_prompt_embeds_mask=None,
         negative_prompt_poolers=None,
-        dtype=torch.bfloat16,
+        dtype=torch.float16,
         device=None,
         negative_kwargs=None,
         callback=None,
@@ -58,7 +58,13 @@ def sample_hunyuan(
     if batch_size is None:
         batch_size = int(prompt_embeds.shape[0])
 
-    latents = torch.randn((batch_size, 16, (frames + 3) // 4, height // 8, width // 8), generator=generator, device=generator.device).to(device=device, dtype=torch.float32)
+    latent_shape = (batch_size, 16, (frames + 3) // 4, height // 8, width // 8)
+    generator_device = getattr(generator, "device", device) if generator is not None else device
+    if generator is not None and torch.device(generator_device).type != torch.device(device).type:
+        latents = torch.randn(latent_shape, generator=generator, device=generator_device, dtype=dtype)
+        latents = latents.to(device=device, dtype=dtype)
+    else:
+        latents = torch.randn(latent_shape, generator=generator, device=device, dtype=dtype)
 
     B, C, T, H, W = latents.shape
     seq_length = T * H * W // 4
@@ -74,14 +80,16 @@ def sample_hunyuan(
 
     if initial_latent is not None:
         sigmas = sigmas * strength
-        first_sigma = sigmas[0].to(device=device, dtype=torch.float32)
-        initial_latent = initial_latent.to(device=device, dtype=torch.float32)
-        latents = initial_latent.float() * (1.0 - first_sigma) + latents.float() * first_sigma
+        first_sigma = sigmas[0].to(device=device, dtype=dtype)
+        initial_latent = initial_latent.to(device=device, dtype=dtype)
+        latents.mul_(first_sigma)
+        initial_latent.mul_(1.0 - first_sigma)
+        latents.add_(initial_latent)
 
     if concat_latent is not None:
-        concat_latent = concat_latent.to(latents)
+        concat_latent = concat_latent.to(device=latents.device, dtype=dtype)
 
-    distilled_guidance = torch.tensor([distilled_guidance_scale * 1000.0] * batch_size).to(device=device, dtype=dtype)
+    distilled_guidance = torch.tensor([distilled_guidance_scale * 1000.0] * batch_size, device=device, dtype=dtype)
 
     prompt_embeds = repeat_to_batch_size(prompt_embeds, batch_size)
     prompt_embeds_mask = repeat_to_batch_size(prompt_embeds_mask, batch_size)

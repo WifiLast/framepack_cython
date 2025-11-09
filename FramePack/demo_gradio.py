@@ -26,6 +26,20 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_pro
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
+from diffusers_helper.optimizations import (
+    AdaptiveLatentWindowController,
+    apply_int_nbit_quantization,
+    enforce_low_precision,
+    maybe_compile_module,
+    prune_transformer_layers,
+)
+
+
+torch.set_float32_matmul_precision("high")
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cudnn.benchmark = True
 
 
 parser = argparse.ArgumentParser()
@@ -45,6 +59,8 @@ high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
+MODEL_COMPUTE_DTYPE = torch.float16
+QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
@@ -63,18 +79,22 @@ text_encoder_2.eval()
 image_encoder.eval()
 transformer.eval()
 
+for module in (text_encoder, text_encoder_2, vae, image_encoder, transformer):
+    apply_int_nbit_quantization(module, num_bits=QUANT_BITS, target_dtype=MODEL_COMPUTE_DTYPE)
+    enforce_low_precision(module, activation_dtype=MODEL_COMPUTE_DTYPE)
+
+prune_transformer_layers(
+    transformer,
+    dual_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_DUAL_RATIO", 0.5)),
+    single_keep_ratio=float(os.environ.get("FRAMEPACK_PRUNE_SINGLE_RATIO", 0.5)),
+)
+transformer.enable_gradient_checkpointing()
+transformer.high_quality_fp32_output_for_inference = False
+print('transformer.high_quality_fp32_output_for_inference = False')
+
 if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
-
-transformer.high_quality_fp32_output_for_inference = True
-print('transformer.high_quality_fp32_output_for_inference = True')
-
-transformer.to(dtype=torch.bfloat16)
-vae.to(dtype=torch.float16)
-image_encoder.to(dtype=torch.float16)
-text_encoder.to(dtype=torch.float16)
-text_encoder_2.to(dtype=torch.float16)
 
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
@@ -92,6 +112,8 @@ else:
     image_encoder.to(gpu)
     vae.to(gpu)
     transformer.to(gpu)
+    transformer = maybe_compile_module(transformer, mode="reduce-overhead", dynamic=True)
+    transformer.requires_grad_(False)
 
 stream = AsyncStream()
 
@@ -99,8 +121,10 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    controller = AdaptiveLatentWindowController(latent_window_size, get_cuda_free_memory_gb(gpu))
+    latent_window_size = controller.window_size
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -133,6 +157,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
+        llama_vec = llama_vec.to(dtype=MODEL_COMPUTE_DTYPE)
+        llama_vec_n = llama_vec_n.to(dtype=MODEL_COMPUTE_DTYPE)
+        clip_l_pooler = clip_l_pooler.to(dtype=MODEL_COMPUTE_DTYPE)
+        clip_l_pooler_n = clip_l_pooler_n.to(dtype=MODEL_COMPUTE_DTYPE)
+
         # Processing input image
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
@@ -143,7 +172,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
-        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+        input_image_pt = torch.from_numpy(input_image_np).to(dtype=vae.dtype)
+        input_image_pt.div_(127.5).sub_(1)
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
@@ -153,7 +183,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
-        start_latent = vae_encode(input_image_pt, vae)
+        start_latent = vae_encode(input_image_pt, vae).to(dtype=MODEL_COMPUTE_DTYPE)
 
         # CLIP Vision
 
@@ -163,15 +193,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             load_model_as_complete(image_encoder, target_device=gpu)
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
 
         # Dtype
 
-        llama_vec = llama_vec.to(transformer.dtype)
-        llama_vec_n = llama_vec_n.to(transformer.dtype)
-        clip_l_pooler = clip_l_pooler.to(transformer.dtype)
-        clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+        llama_vec = llama_vec.to(dtype=MODEL_COMPUTE_DTYPE)
+        llama_vec_n = llama_vec_n.to(dtype=MODEL_COMPUTE_DTYPE)
+        clip_l_pooler = clip_l_pooler.to(dtype=MODEL_COMPUTE_DTYPE)
+        clip_l_pooler_n = clip_l_pooler_n.to(dtype=MODEL_COMPUTE_DTYPE)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
 
         # Sampling
 
@@ -180,7 +210,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_latents = torch.zeros(
+            size=(1, 16, 1 + 2 + 16, height // 8, width // 8),
+            dtype=MODEL_COMPUTE_DTYPE,
+        ).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
 
@@ -257,7 +290,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
-                dtype=torch.bfloat16,
+                dtype=MODEL_COMPUTE_DTYPE,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,

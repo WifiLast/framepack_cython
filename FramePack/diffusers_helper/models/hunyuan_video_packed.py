@@ -831,10 +831,12 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
     def gradient_checkpointing_method(self, block, *args):
         if self.use_gradient_checkpointing:
-            result = torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
-        else:
-            result = block(*args)
-        return result
+            requires_grad = torch.is_grad_enabled() and any(
+                isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
+            )
+            if requires_grad:
+                return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
+        return block(*args)
 
     def process_input_hidden_states(
             self,
