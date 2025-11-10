@@ -30,6 +30,12 @@ from diffusers_helper.kv_cache import (
 
 enabled_backends = []
 
+ATTN_ACCEL_MODE = "standard"
+
+def set_attention_accel_mode(mode: str):
+    global ATTN_ACCEL_MODE
+    ATTN_ACCEL_MODE = mode.lower()
+
 if torch.backends.cuda.flash_sdp_enabled():
     enabled_backends.append("flash")
 if torch.backends.cuda.math_sdp_enabled():
@@ -120,6 +126,19 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
         if sageattn is not None:
             x = sageattn(q, k, v, tensor_layout='NHD')
             return x
+
+        if ATTN_ACCEL_MODE == "aggressive" and xformers_attn_func is not None:
+            B, L, H, C = q.shape
+            q_flat = q.permute(0, 2, 1, 3).reshape(B * H, L, C).contiguous()
+            k_flat = k.permute(0, 2, 1, 3).reshape(B * H, L, C).contiguous()
+            v_flat = v.permute(0, 2, 1, 3).reshape(B * H, L, C).contiguous()
+            dtype = torch.float16 if q_flat.dtype == torch.float32 else q_flat.dtype
+            q_flat = q_flat.to(dtype=dtype)
+            k_flat = k_flat.to(dtype=dtype)
+            v_flat = v_flat.to(dtype=dtype)
+            out = xformers_attn_func(q_flat, k_flat, v_flat, attn_bias=None, p=0.0)
+            out = out.reshape(B, H, L, C).permute(0, 2, 1, 3).contiguous()
+            return out
 
         if flash_attn_func is not None:
             x = flash_attn_func(q, k, v)

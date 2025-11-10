@@ -41,6 +41,7 @@ from diffusers_helper.cpu_opt import (
     optimized_resize_and_center_crop,
 )
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 from diffusers_helper.thread_utils import AsyncStream, async_run
@@ -720,6 +721,7 @@ parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], 
 parser.add_argument("--disable-fbcache", action='store_true')
 parser.add_argument("--disable-sim-cache", action='store_true')
 parser.add_argument("--disable-kv-cache", action='store_true')
+parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard"))
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -763,6 +765,15 @@ SIM_CACHE_VERBOSE = os.environ.get("FRAMEPACK_SIM_CACHE_VERBOSE", "0") == "1"
 ENABLE_KV_CACHE = (os.environ.get("FRAMEPACK_ENABLE_KV_CACHE", "0") == "1") and not args.disable_kv_cache
 KV_CACHE_LENGTH = int(os.environ.get("FRAMEPACK_KV_CACHE_LEN", "4096"))
 KV_CACHE_VERBOSE = os.environ.get("FRAMEPACK_KV_CACHE_VERBOSE", "0") == "1"
+XFORMERS_MODE = (args.xformers_mode or os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard")).lower()
+if XFORMERS_MODE not in {"off", "standard", "aggressive"}:
+    XFORMERS_MODE = "standard"
+if XFORMERS_MODE == "aggressive":
+    os.environ["XFORMERS_ATTENTION_OP"] = "cutlass"
+    os.environ["XFORMERS_FORCE_DISABLE_DROPOUT"] = "1"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+set_attention_accel_mode(XFORMERS_MODE)
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
