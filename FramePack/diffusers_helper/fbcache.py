@@ -195,3 +195,29 @@ class FirstBlockCache:
         if self.config.verbose:
             print(f"[FBCache] miss diff={ratio:.4f} (threshold={self.config.threshold:.4f})")
         return False
+
+    @staticmethod
+    def _clone_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        return tensor.detach().cpu()
+
+    def state_dict(self):
+        return {
+            "config": dataclasses.asdict(self.config) if self.config else None,
+            "prev_first_residual": self._clone_tensor(self.prev_first_residual),
+            "hidden_states_residual": self._clone_tensor(self.hidden_states_residual),
+            "encoder_hidden_states_residual": self._clone_tensor(self.encoder_hidden_states_residual),
+            "_last_diff": self._last_diff,
+        }
+
+    def load_state_dict(self, state_dict):
+        if not isinstance(state_dict, dict):
+            return
+        config_data = state_dict.get("config")
+        if config_data:
+            self.config = FirstBlockCacheConfig(**config_data)
+        self.prev_first_residual = state_dict.get("prev_first_residual")
+        self.hidden_states_residual = state_dict.get("hidden_states_residual")
+        self.encoder_hidden_states_residual = state_dict.get("encoder_hidden_states_residual")
+        self._last_diff = state_dict.get("_last_diff")

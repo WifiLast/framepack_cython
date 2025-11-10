@@ -1,4 +1,5 @@
 import math
+import dataclasses
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -107,6 +108,40 @@ class BlockSimilarityCache:
         if self.use_faiss and self._faiss_index is not None:
             self._faiss_index.reset()
 
+    def state_dict(self):
+        serialized_entries = []
+        for entry in self.entries:
+            serialized_entries.append(
+                {
+                    "key": entry.key.cpu(),
+                    "hidden": entry.hidden.cpu(),
+                    "encoder": entry.encoder.cpu() if entry.encoder is not None else None,
+                    "step": entry.step,
+                }
+            )
+        return {
+            "max_entries": self.max_entries,
+            "max_age": self.max_age,
+            "entries": serialized_entries,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.clear()
+        if not isinstance(state_dict, dict):
+            return
+        entries = state_dict.get("entries", [])
+        for entry in entries:
+            key = entry.get("key")
+            hidden = entry.get("hidden")
+            step = entry.get("step", 0)
+            if key is None or hidden is None:
+                continue
+            encoder = entry.get("encoder")
+            new_entry = BlockCacheEntry(key, hidden, encoder, step)
+            self.entries.append(new_entry)
+        if self.use_faiss:
+            self._rebuild_index()
+
 
 class SimilarityCacheManager:
     def __init__(
@@ -142,3 +177,25 @@ class SimilarityCacheManager:
     def clear(self):
         for cache in self.dual_caches + self.single_caches:
             cache.clear()
+
+    def state_dict(self):
+        return {
+            "config": dataclasses.asdict(self.config) if self.config else None,
+            "global_step": self.global_step,
+            "dual_caches": [cache.state_dict() for cache in self.dual_caches],
+            "single_caches": [cache.state_dict() for cache in self.single_caches],
+        }
+
+    def load_state_dict(self, state_dict):
+        if not isinstance(state_dict, dict):
+            return
+        config_data = state_dict.get("config")
+        if config_data:
+            self.config = SimilarityCacheConfig(**config_data)
+        self.global_step = int(state_dict.get("global_step", 0))
+        dual_states = state_dict.get("dual_caches", [])
+        single_states = state_dict.get("single_caches", [])
+        for cache, cache_state in zip(self.dual_caches, dual_states):
+            cache.load_state_dict(cache_state)
+        for cache, cache_state in zip(self.single_caches, single_states):
+            cache.load_state_dict(cache_state)

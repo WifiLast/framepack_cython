@@ -1,10 +1,13 @@
 from diffusers_helper.hf_login import login
 
 import os
+import atexit
 
 HF_HOME = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 os.environ['HF_HOME'] = HF_HOME
-HF_REPO_CACHE_ROOT = os.path.join(os.path.dirname(__file__), 'Cache', 'hf_repos')
+CACHE_BASE_DIR = os.path.join(os.path.dirname(__file__), 'Cache')
+os.makedirs(CACHE_BASE_DIR, exist_ok=True)
+HF_REPO_CACHE_ROOT = os.path.join(CACHE_BASE_DIR, 'hf_repos')
 os.makedirs(HF_REPO_CACHE_ROOT, exist_ok=True)
 
 ENABLE_QUANT = False
@@ -36,6 +39,49 @@ def _prepare_local_repo(repo_id: str, env_var: str, *, preload: bool, parallel_w
 
 import gradio as gr
 import torch
+
+RUNTIME_CACHE_ENABLED = os.environ.get("FRAMEPACK_RUNTIME_CACHE", "1") != "0"
+RUNTIME_CACHE_ROOT = os.environ.get(
+    "FRAMEPACK_RUNTIME_CACHE_DIR",
+    os.path.join(CACHE_BASE_DIR, "runtime_caches"),
+)
+if RUNTIME_CACHE_ENABLED:
+    os.makedirs(RUNTIME_CACHE_ROOT, exist_ok=True)
+
+
+def _runtime_cache_path(name: str) -> str:
+    return os.path.join(RUNTIME_CACHE_ROOT, f"{name}.pt")
+
+
+def _load_runtime_cache_state(name: str):
+    if not RUNTIME_CACHE_ENABLED:
+        return None
+    path = _runtime_cache_path(name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        return torch.load(path, map_location='cpu')
+    except Exception as exc:
+        print(f'Warning: failed to load runtime cache "{name}": {exc}')
+        return None
+
+
+def _save_runtime_cache_state(name: str, state):
+    if not RUNTIME_CACHE_ENABLED or state is None:
+        return
+    path = _runtime_cache_path(name)
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        print(f'Warning: failed to save runtime cache "{name}": {exc}')
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def _install_torch_compile_guard():
@@ -103,7 +149,7 @@ from diffusers_helper.cpu_opt import (
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete, load_model_chunked, force_free_vram
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from diffusers_helper.clip_vision import hf_clip_vision_encode
@@ -869,11 +915,11 @@ else:
     ENABLE_QUANT = _enable_quant_env == "1"
 ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "0") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "0") == "1"
-ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "0") == "1"
+ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") != "0"
 ENABLE_COMPILE = os.environ.get("FRAMEPACK_ENABLE_COMPILE", "0") == "1"
 CACHE_ROOT = os.environ.get(
     "FRAMEPACK_MODULE_CACHE_DIR",
-    os.path.join(os.path.dirname(__file__), "module_cache"),
+    os.path.join(CACHE_BASE_DIR, "module_cache"),
 )
 CACHE_ROOT = os.path.abspath(CACHE_ROOT)
 DEFAULT_CACHE_ITEMS = int(os.environ.get("FRAMEPACK_MODULE_CACHE_SIZE", "256"))
@@ -1114,6 +1160,10 @@ if ENABLE_FBCACHE:
         verbose=FBCACHE_VERBOSE,
     )
     print(f'First block cache enabled (threshold={FBCACHE_THRESHOLD:.4f}).')
+    fb_state = _load_runtime_cache_state("first_block_cache")
+    if fb_state:
+        transformer_core.first_block_cache.load_state_dict(fb_state)
+        print('Loaded persisted first-block cache state.')
 else:
     transformer_core.enable_first_block_cache(enabled=False)
 
@@ -1130,6 +1180,10 @@ if ENABLE_SIM_CACHE:
         f'Similarity cache enabled (threshold={SIM_CACHE_THRESHOLD:.3f}, '
         f'max_skip={SIM_CACHE_MAX_SKIP}, entries={SIM_CACHE_MAX_ENTRIES}).'
     )
+    sim_state = _load_runtime_cache_state("similarity_cache")
+    if sim_state and transformer_core.similarity_cache_manager is not None:
+        transformer_core.similarity_cache_manager.load_state_dict(sim_state)
+        print('Loaded persisted similarity cache state.')
 else:
     transformer_core.enable_similarity_cache(enabled=False)
 
@@ -1140,8 +1194,35 @@ if ENABLE_KV_CACHE:
         verbose=KV_CACHE_VERBOSE,
     )
     print(f'KV cache enabled (max length={KV_CACHE_LENGTH}).')
+    kv_state = _load_runtime_cache_state("kv_cache")
+    if kv_state and transformer_core.kv_cache_manager is not None:
+        transformer_core.kv_cache_manager.load_state_dict(kv_state)
+        print('Loaded persisted KV cache state.')
 else:
     transformer_core.enable_kv_cache(enabled=False)
+
+
+def _persist_runtime_caches_on_exit():
+    if not RUNTIME_CACHE_ENABLED:
+        return
+    core = globals().get("TRANSFORMER_BACKBONE") or globals().get("transformer_core")
+    if core is None:
+        return
+    if ENABLE_FBCACHE:
+        fb_cache = getattr(core, "first_block_cache", None)
+        if fb_cache is not None:
+            _save_runtime_cache_state("first_block_cache", fb_cache.state_dict())
+    if ENABLE_SIM_CACHE:
+        sim_manager = getattr(core, "similarity_cache_manager", None)
+        if sim_manager is not None:
+            _save_runtime_cache_state("similarity_cache", sim_manager.state_dict())
+    if ENABLE_KV_CACHE:
+        kv_manager = getattr(core, "kv_cache_manager", None)
+        if kv_manager is not None:
+            _save_runtime_cache_state("kv_cache", kv_manager.state_dict())
+
+
+atexit.register(_persist_runtime_caches_on_exit)
 
 if ENABLE_QUANT:
     manual_quant_targets = [vae, image_encoder]
@@ -1308,28 +1389,43 @@ outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
 
-def vae_decode_chunked(latents, vae, chunk_size=8):
+def vae_decode_chunked(latents, vae, chunk_size=1):
     """Decode latents in chunks to avoid OOM errors."""
     b, c, t, h, w = latents.shape
 
     if t <= chunk_size:
         # Small enough to decode at once
-        return vae_decode(latents, vae)
+        with inference_autocast():
+            result = vae_decode(latents, vae)
+        return result.cpu()
 
-    # Decode in chunks
+    # Decode in chunks - one frame at a time for extreme memory constraints
     chunks = []
     for i in range(0, t, chunk_size):
         end_idx = min(i + chunk_size, t)
         chunk_latents = latents[:, :, i:end_idx, :, :]
+
         with inference_autocast():
             chunk_pixels = vae_decode(chunk_latents, vae)
+
+        # Move to CPU immediately and clear GPU memory
         chunks.append(chunk_pixels.cpu())
-        # Clear CUDA cache after each chunk
+        del chunk_pixels, chunk_latents
+
+        # Aggressive CUDA cache clearing after each chunk
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
-    # Concatenate all chunks
-    return torch.cat(chunks, dim=2)
+    # Concatenate all chunks on CPU
+    result = torch.cat(chunks, dim=2)
+
+    # Clear chunks list
+    del chunks
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
 
 
 @torch.inference_mode()
@@ -1556,22 +1652,41 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram and not USE_FSDP:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+                # Aggressive offloading with synchronization
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8, aggressive=True)
+
+                # Force free VRAM before loading VAE
+                force_free_vram(target_gb=10.0)
+
+                # Use chunked loading for VAE if needed
+                try:
+                    load_model_as_complete(vae, target_device=gpu)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print("OOM loading VAE, trying chunked loading...")
+                        load_model_chunked(vae, target_device=gpu, max_chunk_size_mb=256)
+                    else:
+                        raise
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
+            # Force clear cache before VAE decode
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             if history_pixels is None:
-                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=4)
+                history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=1)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=4)
+                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=1)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if not high_vram:
                 unload_complete_models()
+                force_free_vram(target_gb=2.0)
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 

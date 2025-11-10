@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -42,4 +43,36 @@ class KVCachingManager:
 
     def append(self, key: str, new_k: torch.Tensor, new_v: torch.Tensor):
         self.update(key, new_k, new_v)
+
+    def state_dict(self):
+        serialized = {}
+        for key, (k, v) in self.caches.items():
+            serialized[key] = {
+                "k": k.detach().cpu(),
+                "v": v.detach().cpu(),
+            }
+        return {
+            "config": dataclasses.asdict(self.config) if self.config else None,
+            "position_offset": self.position_offset,
+            "caches": serialized,
+        }
+
+    def load_state_dict(self, state_dict):
+        if not isinstance(state_dict, dict):
+            return
+        config_data = state_dict.get("config")
+        if config_data:
+            self.config = KVCachingConfig(**config_data)
+        self.position_offset = int(state_dict.get("position_offset", 0))
+        caches = state_dict.get("caches", {})
+        self.caches = {}
+        if isinstance(caches, dict):
+            for key, tensors in caches.items():
+                if not isinstance(tensors, dict):
+                    continue
+                k = tensors.get("k")
+                v = tensors.get("v")
+                if k is None or v is None:
+                    continue
+                self.caches[key] = (k, v)
 
