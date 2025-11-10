@@ -769,7 +769,7 @@ QUANT_BITS = int(os.environ.get("FRAMEPACK_QUANT_BITS", "8"))
 USE_BITSANDBYTES = os.environ.get("FRAMEPACK_USE_BNB", "0") == "1"
 USE_FSDP = os.environ.get("FRAMEPACK_USE_FSDP", "0") == "1"
 ENABLE_QUANT = os.environ.get("FRAMEPACK_ENABLE_QUANT", "0") == "1"
-ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "1") == "1"
+ENABLE_PRUNE = os.environ.get("FRAMEPACK_ENABLE_PRUNE", "0") == "1"
 ENABLE_OPT_CACHE = os.environ.get("FRAMEPACK_ENABLE_OPT_CACHE", "1") == "1"
 ENABLE_MODULE_CACHE = os.environ.get("FRAMEPACK_ENABLE_MODULE_CACHE", "1") == "1"
 CACHE_ROOT = os.environ.get(
