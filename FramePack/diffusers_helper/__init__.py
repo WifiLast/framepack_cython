@@ -10,6 +10,11 @@ from .inference import (
     prepare_module_for_inference,
     tensor_core_multiple_for_dtype,
 )
+from .cpu_opt import (
+    cpu_preprocessing_active,
+    normalize_uint8_image,
+    optimized_resize_and_center_crop,
+)
 
 ensure_torchvision_compat()
 
@@ -24,4 +29,7 @@ __all__ = [
     "pad_batch_to_multiple",
     "prepare_module_for_inference",
     "tensor_core_multiple_for_dtype",
+    "cpu_preprocessing_active",
+    "normalize_uint8_image",
+    "optimized_resize_and_center_crop",
 ]

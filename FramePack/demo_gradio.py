@@ -35,6 +35,11 @@ from transformers import (
 )
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.cpu_opt import (
+    cpu_preprocessing_active,
+    normalize_uint8_image,
+    optimized_resize_and_center_crop,
+)
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
@@ -740,6 +745,9 @@ INFERENCE_CONFIG = build_default_inference_config(torchscript=torchscript_config
 configure_inference_environment(INFERENCE_CONFIG)
 MODEL_COMPUTE_DTYPE = INFERENCE_CONFIG.autocast_dtype if INFERENCE_CONFIG.autocast_dtype in (torch.float16, torch.bfloat16) else torch.float16
 TENSOR_CORE_MULTIPLE = tensor_core_multiple_for_dtype(MODEL_COMPUTE_DTYPE, INFERENCE_CONFIG)
+CPU_PREPROCESS_ACCEL = cpu_preprocessing_active()
+if CPU_PREPROCESS_ACCEL:
+    print('CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).')
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
@@ -1138,12 +1146,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         height, width = align_resolution(height, width, multiple=64)
-        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        accelerated = optimized_resize_and_center_crop(input_image, target_width=width, target_height=height)
+        if accelerated is None:
+            input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        else:
+            input_image_np = accelerated
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
-        input_image_pt = torch.from_numpy(input_image_np).to(dtype=vae.dtype)
-        input_image_pt.div_(127.5).sub_(1)
+        normalized_np = normalize_uint8_image(input_image_np)
+        if normalized_np is not None:
+            input_image_pt = torch.from_numpy(normalized_np).to(dtype=vae.dtype)
+        else:
+            input_image_pt = torch.from_numpy(input_image_np).to(dtype=vae.dtype)
+            input_image_pt.div_(127.5).sub_(1)
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding

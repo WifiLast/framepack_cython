@@ -81,6 +81,7 @@ FramePack ships with an inference-focused execution engine. Models are always sw
 - `FRAMEPACK_JIT_STRICT=1` enforces strict shape checking during tracing. Artifacts are frozen, optimized, and can be loaded later with `torch.jit.load` (metadata is stored alongside the `.pt` file).
 - Autocast behaviour can be adjusted with `FRAMEPACK_AUTOCAST_DTYPE` (`fp16`, `bf16`, `fp32`) and `FRAMEPACK_ENABLE_AUTOCAST=0` (disable). Set `FRAMEPACK_ALLOW_TF32=0` to keep TF32 off.
 - Tensor-core alignment factors can be tuned through `FRAMEPACK_TENSORCORE_MULT_FP16` and `FRAMEPACK_TENSORCORE_MULT_TF32`. Batch replication for small batches can be managed via `FRAMEPACK_MIN_BATCH`.
+- CPU-side preprocessing (image resizing + normalization) can use SIMD/OpenCV + oneDAL pipelines by default. Disable with `FRAMEPACK_CPU_OPT=0` or control thread count via `FRAMEPACK_CPU_OPT_THREADS=<n>`.
 
 These knobs keep inference paths deterministic while allowing you to trade build time for runtime performance when deploying on constrained GPUs or exporting TorchScript modules.
 
