@@ -722,12 +722,15 @@ parser.add_argument("--disable-fbcache", action='store_true')
 parser.add_argument("--disable-sim-cache", action='store_true')
 parser.add_argument("--disable-kv-cache", action='store_true')
 parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard"))
+parser.add_argument("--fast-start", action='store_true', help="Skip optional optimizations to reduce startup latency.")
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
 # For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
+
+FAST_START = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "1"
 
 CACHE_MODE = args.cache_mode.lower()
 
@@ -800,13 +803,15 @@ CACHE_ROOT = os.environ.get(
 CACHE_ROOT = os.path.abspath(CACHE_ROOT)
 DEFAULT_CACHE_ITEMS = int(os.environ.get("FRAMEPACK_MODULE_CACHE_SIZE", "256"))
 OPTIMIZED_MODEL_PATH = None
-if ENABLE_OPT_CACHE:
+if ENABLE_OPT_CACHE and not FAST_START:
     OPTIMIZED_MODEL_PATH = os.environ.get(
         "FRAMEPACK_OPTIMIZED_TRANSFORMER",
         os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_quantized.pt"),
     )
     OPTIMIZED_MODEL_DIR = os.path.dirname(OPTIMIZED_MODEL_PATH) or "."
     os.makedirs(OPTIMIZED_MODEL_DIR, exist_ok=True)
+elif ENABLE_OPT_CACHE and FAST_START:
+    print('Fast-start mode -> skipping optimized transformer cache initialization.')
 bnb_config = None
 bnb_device_map = os.environ.get("FRAMEPACK_BNB_DEVICE_MAP", "auto")
 
@@ -1017,14 +1022,18 @@ else:
         enforce_low_precision(text_encoder, activation_dtype=MODEL_COMPUTE_DTYPE)
         enforce_low_precision(text_encoder_2, activation_dtype=MODEL_COMPUTE_DTYPE)
 
-if torch.cuda.is_available():
+if torch.cuda.is_available() and not FAST_START:
     if not USE_BITSANDBYTES:
         text_encoder = maybe_compile_module(text_encoder, mode="reduce-overhead", dynamic=False)
         text_encoder_2 = maybe_compile_module(text_encoder_2, mode="reduce-overhead", dynamic=False)
     image_encoder = maybe_compile_module(image_encoder, mode="reduce-overhead", dynamic=False)
+elif torch.cuda.is_available() and FAST_START:
+    print('Fast-start mode -> skipping torch.compile for encoders.')
 
-if INFERENCE_CONFIG.torchscript.mode == "off":
+if INFERENCE_CONFIG.torchscript.mode == "off" and not FAST_START:
     transformer_core = maybe_compile_module(transformer_core, mode="reduce-overhead", dynamic=True)
+elif INFERENCE_CONFIG.torchscript.mode == "off" and FAST_START:
+    print('Fast-start mode -> skipping torch.compile for transformer.')
 else:
     print(f'Skipping torch.compile for transformer (TorchScript mode: {INFERENCE_CONFIG.torchscript.mode}).')
 
@@ -1085,7 +1094,8 @@ if ENABLE_OPT_CACHE and not optimized_transformer_loaded and OPTIMIZED_MODEL_PAT
     torch.save(transformer_core, OPTIMIZED_MODEL_PATH)
     print(f'Saved optimized transformer weights to {OPTIMIZED_MODEL_PATH}')
 
-if INFERENCE_CONFIG.torchscript.mode != "off" or INFERENCE_CONFIG.torchscript.load_path:
+torchscript_prep_required = INFERENCE_CONFIG.torchscript.mode != "off" or INFERENCE_CONFIG.torchscript.load_path
+if torchscript_prep_required:
     try:
         transformer_device = next(transformer_core.parameters()).device
     except StopIteration:
@@ -1102,6 +1112,8 @@ if INFERENCE_CONFIG.torchscript.mode != "off" or INFERENCE_CONFIG.torchscript.lo
         artifact_path=artifact_target,
         example_builder=example_builder,
     )
+elif FAST_START:
+    print('Fast-start mode -> skipping TorchScript preparation step.')
 
 torchscript_active = (
     INFERENCE_CONFIG.torchscript.mode != "off"
