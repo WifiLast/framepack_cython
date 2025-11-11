@@ -1519,40 +1519,67 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
 
     chunk_size = _auto_select_vae_chunk_size(latents, quality_mode=quality_mode, requested_chunk=chunk_size)
 
-    if t <= chunk_size:
-        # Small enough to decode at once
-        with inference_autocast():
-            result = vae_decode(latents, vae)
-        return result.cpu()
+    def _decode_with_chunk_size(active_chunk_size: int):
+        if t <= active_chunk_size:
+            with inference_autocast():
+                decoded = vae_decode(latents, vae)
+            return decoded.cpu()
 
-    # Decode in chunks - balance between memory and quality
-    chunks = []
-    for i in range(0, t, chunk_size):
-        end_idx = min(i + chunk_size, t)
-        chunk_latents = latents[:, :, i:end_idx, :, :]
+        chunks = []
+        for i in range(0, t, active_chunk_size):
+            end_idx = min(i + active_chunk_size, t)
+            chunk_latents = latents[:, :, i:end_idx, :, :]
 
-        with inference_autocast():
-            chunk_pixels = vae_decode(chunk_latents, vae)
+            with inference_autocast():
+                chunk_pixels = vae_decode(chunk_latents, vae)
 
-        # Move to CPU immediately and clear GPU memory
-        chunks.append(chunk_pixels.cpu())
-        del chunk_pixels, chunk_latents
+            # Move to CPU immediately and clear GPU memory
+            chunks.append(chunk_pixels.cpu())
+            del chunk_pixels, chunk_latents
 
-        # Clear cache after each chunk (less aggressive in quality mode)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if not quality_mode:
+                    torch.cuda.synchronize()
+
+        result = torch.cat(chunks, dim=2)
+
+        del chunks
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            if not quality_mode:
+
+        return result
+
+    attempt_chunk = chunk_size
+    last_error = None
+
+    while attempt_chunk >= 1:
+        try:
+            return _decode_with_chunk_size(attempt_chunk)
+        except torch.cuda.OutOfMemoryError as oom:
+            last_error = oom
+            if attempt_chunk == 1:
+                raise
+
+            next_chunk = max(1, attempt_chunk // 2)
+            if next_chunk == attempt_chunk:
+                raise
+
+            warn_msg = f'VAE decode OOM at chunk_size={attempt_chunk}; retrying with chunk_size={next_chunk}'
+            if quality_mode and next_chunk < 4:
+                warn_msg += ' (quality fallback)'
+            print(warn_msg)
+
+            attempt_chunk = next_chunk
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-    # Concatenate all chunks on CPU
-    result = torch.cat(chunks, dim=2)
+    if last_error is not None:
+        raise last_error
 
-    # Clear chunks list
-    del chunks
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return result
+    return _decode_with_chunk_size(1)
 
 
 @torch.inference_mode()
