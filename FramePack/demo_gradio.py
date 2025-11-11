@@ -149,7 +149,8 @@ from diffusers_helper.cpu_opt import (
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete, load_model_chunked, force_free_vram
+from diffusers_helper import memory as memory_v1
+from diffusers_helper import memory_v2
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from diffusers_helper.clip_vision import hf_clip_vision_encode
@@ -836,12 +837,15 @@ parser.add_argument("--disable-sim-cache", action='store_true')
 parser.add_argument("--disable-kv-cache", action='store_true')
 parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard"))
 parser.add_argument("--fast-start", action='store_true', help="Skip optional optimizations to reduce startup latency.")
+parser.add_argument("--use-memory-v2", action="store_true", help="Enable optimized memory_v2 backend (async streams, pinned memory, cached stats).")
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
 # For linux server probably use --server 127.0.0.1 or do not use any cmd flags
 
 print(args)
+if args.use_memory_v2:
+    print("memory_v2 backend enabled (async streams, pinned memory, cached stats).")
 
 FAST_START = args.fast_start or os.environ.get("FRAMEPACK_FAST_START", "0") == "1"
 PARALLEL_LOADERS = int(os.environ.get("FRAMEPACK_PARALLEL_LOADERS", "0"))
@@ -855,6 +859,74 @@ VAE_CHUNK_OVERRIDE = max(0, int(os.environ.get("FRAMEPACK_VAE_CHUNK_SIZE", "0"))
 VAE_CHUNK_RESERVE_GB = float(os.environ.get("FRAMEPACK_VAE_CHUNK_RESERVE_GB", "4.0"))
 VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.5"))
 VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "8")))
+
+memory_backend = memory_v2 if args.use_memory_v2 else memory_v1
+memory_optim = None
+if args.use_memory_v2:
+    memory_optim = memory_v2.MemoryOptimizationConfig(
+        use_async_streams=True,
+        use_pinned_memory=True,
+        cache_memory_stats=True,
+    )
+
+cpu = memory_backend.cpu
+gpu = memory_backend.gpu
+DynamicSwapInstaller = memory_backend.DynamicSwapInstaller
+unload_complete_models = memory_backend.unload_complete_models
+load_model_as_complete = memory_backend.load_model_as_complete
+fake_diffusers_current_device = memory_backend.fake_diffusers_current_device
+force_free_vram = memory_backend.force_free_vram
+
+
+def get_cuda_free_memory_gb(device=None):
+    if args.use_memory_v2:
+        return memory_backend.get_cuda_free_memory_gb(device=device, optim_config=memory_optim)
+    return memory_backend.get_cuda_free_memory_gb(device=device)
+
+
+def move_model_to_device_with_memory_preservation(model, target_device, preserved_memory_gb=0, aggressive=False):
+    if args.use_memory_v2:
+        return memory_backend.move_model_to_device_with_memory_preservation(
+            model,
+            target_device,
+            preserved_memory_gb=preserved_memory_gb,
+            aggressive=aggressive,
+            optim_config=memory_optim,
+        )
+    return memory_backend.move_model_to_device_with_memory_preservation(
+        model,
+        target_device,
+        preserved_memory_gb=preserved_memory_gb,
+        aggressive=aggressive,
+    )
+
+
+def offload_model_from_device_for_memory_preservation(model, target_device, preserved_memory_gb=0, aggressive=False):
+    if args.use_memory_v2:
+        return memory_backend.offload_model_from_device_for_memory_preservation(
+            model,
+            target_device,
+            preserved_memory_gb=preserved_memory_gb,
+            aggressive=aggressive,
+            optim_config=memory_optim,
+        )
+    return memory_backend.offload_model_from_device_for_memory_preservation(
+        model,
+        target_device,
+        preserved_memory_gb=preserved_memory_gb,
+        aggressive=aggressive,
+    )
+
+
+def load_model_chunked(model, target_device, max_chunk_size_mb=512):
+    if args.use_memory_v2:
+        return memory_backend.load_model_chunked(
+            model,
+            target_device,
+            max_chunk_size_mb=max_chunk_size_mb,
+            optim_config=memory_optim,
+        )
+    return memory_backend.load_model_chunked(model, target_device, max_chunk_size_mb=max_chunk_size_mb)
 
 jit_mode = (args.jit_mode or "off").lower()
 default_jit_artifact = os.path.join(os.path.dirname(__file__), "optimized_models", "transformer_torchscript.pt")
