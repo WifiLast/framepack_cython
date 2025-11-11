@@ -1750,6 +1750,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
             stream.output_queue.push(('file', output_filename))
+            _persist_runtime_caches_on_exit()
 
             if is_last_section:
                 break
