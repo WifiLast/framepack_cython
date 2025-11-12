@@ -42,29 +42,29 @@ import gradio.route_utils as gr_route_utils
 import torch
 
 
-def _patch_gradio_proxy_request_url():
-    """Ensure proxied hosts keep their path when Gradio infers the request URL."""
-    if getattr(gr_route_utils, "_framepack_request_url_patch", False):
+def _patch_gradio_proxy_api_path():
+    """Allow proxied hosts to keep the API path when resolving queue/call requests."""
+    if getattr(gr_route_utils, "_framepack_api_path_patch", False):
         return
 
-    original_get_request_url = gr_route_utils.get_request_url
+    original_get_api_call_path = gr_route_utils.get_api_call_path
+    queue_api_url = f"{gr_route_utils.API_PREFIX}/queue/join"
+    generic_api_url = f"{gr_route_utils.API_PREFIX}/call"
 
-    def _get_request_url_with_path(request):
-        x_forwarded_host = gr_route_utils.get_first_header_value(request, "x-forwarded-host")
-        if x_forwarded_host:
-            host = x_forwarded_host.split(",")[0].strip()
-            forwarded_proto = gr_route_utils.get_first_header_value(request, "x-forwarded-proto")
-            scheme = (forwarded_proto or request.url.scheme or "http").split(",")[0].strip()
-            path = request.url.path or ""
-            url = f"{scheme}://{host}{path}".split("?", 1)[0].rstrip("/")
-            return url or f"{scheme}://{host}"
-        return original_get_request_url(request)
+    def _get_api_call_path(request):
+        request_path = (getattr(request.url, "path", "") or "").rstrip("/")
+        if request_path.endswith(queue_api_url):
+            return queue_api_url
+        start_index = request_path.rfind(generic_api_url)
+        if start_index >= 0:
+            return request_path[start_index:]
+        return original_get_api_call_path(request)
 
-    gr_route_utils.get_request_url = _get_request_url_with_path
-    gr_route_utils._framepack_request_url_patch = True
+    gr_route_utils.get_api_call_path = _get_api_call_path
+    gr_route_utils._framepack_api_path_patch = True
 
 
-_patch_gradio_proxy_request_url()
+_patch_gradio_proxy_api_path()
 
 RUNTIME_CACHE_ENABLED = os.environ.get("FRAMEPACK_RUNTIME_CACHE", "1") != "0"
 RUNTIME_CACHE_ROOT = os.environ.get(
@@ -1859,10 +1859,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 history_pixels = vae_decode_chunked(real_history_latents, vae, chunk_size=None, quality_mode=quality_mode)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                section_latent_frames = min(section_latent_frames, real_history_latents.shape[2])
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode_chunked(real_history_latents[:, :, :section_latent_frames], vae, chunk_size=None, quality_mode=quality_mode)
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                current_pixels = vae_decode_chunked(
+                    real_history_latents[:, :, :section_latent_frames], vae, chunk_size=None, quality_mode=quality_mode
+                )
+                overlap = min(overlapped_frames, current_pixels.shape[2], history_pixels.shape[2])
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlap)
 
             if not high_vram:
                 unload_complete_models()
