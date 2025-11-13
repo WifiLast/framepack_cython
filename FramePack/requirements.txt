@@ -23,8 +23,8 @@ requests==2.31.0
 torchsde==0.2.6
 
 # Optional: Performance Optimizations
-xformers>=0.0.20  # Recommended for attention optimization
-bitsandbytes>=0.41.0  # For 4-bit quantization (BNB)
+xformers  # Recommended for attention optimization
+bitsandbytes  # For 4-bit quantization (BNB)
 
 # Optional: Advanced Attention Backends
 # flash-attn>=2.0.0  # Flash Attention (may conflict with TensorRT)

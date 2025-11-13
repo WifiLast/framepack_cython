@@ -1369,8 +1369,35 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
 
     # Initialize TensorRT transformer wrapper if enabled
     if TRT_TRANSFORMER_ENABLED:
+        # Check for incompatible configurations
+        warnings = []
+        if USE_BITSANDBYTES:
+            warnings.append("BitsAndBytes quantization is enabled - TensorRT requires FP16/BF16 precision")
+        if BNB_CPU_OFFLOAD:
+            warnings.append("CPU offload is enabled - TensorRT requires full GPU model")
+        if USE_FSDP:
+            warnings.append("FSDP is enabled - TensorRT may not work with distributed models")
+
+        if warnings:
+            print("\n" + "="*80)
+            print("WARNING: TensorRT transformer has compatibility issues:")
+            for w in warnings:
+                print(f"  - {w}")
+            print("\nTensorRT transformer will fall back to PyTorch (no speedup).")
+            print("Recommended command for TensorRT acceleration:")
+            print("  python demo_gradio.py --enable-tensorrt --tensorrt-transformer")
+            print("  (Remove BNB and CPU offload flags)")
+            print("="*80 + "\n")
+
         try:
             print(f"Initializing TensorRT transformer wrapper (max_cached_shapes={TRT_MAX_CACHED_SHAPES})...")
+
+            # Check if transformer is on GPU and in correct dtype
+            if hasattr(transformer_core, 'device'):
+                print(f"Transformer device: {transformer_core.device}")
+            if hasattr(transformer_core, 'dtype'):
+                print(f"Transformer dtype: {transformer_core.dtype}")
+
             TENSORRT_TRANSFORMER = TensorRTTransformer(
                 transformer_core,
                 TENSORRT_RUNTIME,
@@ -1378,8 +1405,12 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
             )
             TENSORRT_TRANSFORMER._max_cached_shapes = TRT_MAX_CACHED_SHAPES
             print("TensorRT transformer wrapper initialized. Engines will compile on first use per shape.")
+            if not warnings:
+                print("NOTE: First compilation may take 5-15 minutes and requires ~16GB GPU VRAM.")
         except Exception as exc:
             print(f"Failed to initialize TensorRT transformer: {exc}")
+            import traceback
+            traceback.print_exc()
             TENSORRT_TRANSFORMER = None
     else:
         print("TensorRT transformer disabled (set FRAMEPACK_TRT_TRANSFORMER=1 to enable).")
@@ -1831,8 +1862,17 @@ def worker(
 
     if use_tensorrt_transformer and TENSORRT_TRANSFORMER is not None:
         transformer_impl = TENSORRT_TRANSFORMER
-        print("TensorRT transformer acceleration engaged for this job.")
-        print("Note: TensorRT will compile transformer engines on first use per shape, which may take several minutes.")
+        print("\n" + "="*60)
+        print("TensorRT transformer acceleration ENGAGED for this job")
+        print("="*60)
+        print("First inference will trigger TensorRT compilation:")
+        print("  - This may take 5-15 minutes on first run")
+        print("  - Subsequent runs with same shape will be fast")
+        print("  - Watch for 'Compiling TensorRT transformer engine' message")
+        print("="*60 + "\n")
+    elif use_tensorrt_transformer and TENSORRT_TRANSFORMER is None:
+        print("\nWARNING: TensorRT transformer requested but not available")
+        print("Check initialization warnings above for details\n")
 
     transformer_backbone = getattr(transformer_impl, "module", None)
     if transformer_backbone is None:
