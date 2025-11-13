@@ -163,6 +163,69 @@ class TensorRTLatentDecoder:
         return decoded.to(dtype=torch.float32, device=latents.device)
 
 
+class VAEEncodeWrapper(nn.Module):
+    """Expose vae.encode as a TRT-compilable module that returns Gaussian stats."""
+
+    def __init__(self, vae: nn.Module):
+        super().__init__()
+        self.vae = vae
+        self.scale = float(getattr(vae.config, "scaling_factor", 1.0))
+
+    def forward(self, sample: torch.Tensor):
+        posterior = self.vae.encode(sample)
+        latent_dist = posterior.latent_dist
+        return latent_dist.mean, latent_dist.logvar
+
+
+class TensorRTLatentEncoder:
+    """TensorRT wrapper for VAE encoding that caches engines per input shape."""
+
+    def __init__(self, vae: nn.Module, runtime: TensorRTRuntime, fallback_fn):
+        self.vae = vae
+        self.runtime = runtime
+        self.fallback_fn = fallback_fn
+        self.wrapper = VAEEncodeWrapper(vae)
+        self._cache: Dict[Tuple[int, int, int, int, torch.dtype], nn.Module] = {}
+        self._lock = threading.Lock()
+
+    def _profile_key(self, shape: torch.Size, dtype: torch.dtype) -> Tuple[int, int, int, int, torch.dtype]:
+        if len(shape) != 5:
+            raise ValueError(f"Expected 5D video tensors for VAE encode, got shape={tuple(shape)}")
+        return (int(shape[0]), int(shape[2]), int(shape[3]), int(shape[4]), dtype)
+
+    def encode(self, sample: torch.Tensor, *, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        if not self.runtime.is_ready:
+            return self.fallback_fn(sample, self.vae)
+
+        key = self._profile_key(sample.shape, sample.dtype)
+        with self._lock:
+            engine = self._cache.get(key)
+            if engine is None:
+                input_spec = self.runtime.make_input_from_shape(tuple(sample.shape), name="pixels")
+                try:
+                    engine = self.runtime.get_or_compile(
+                        f"vae_encode_{key}",
+                        self.wrapper,
+                        input_specs=[input_spec],
+                    )
+                except Exception:
+                    return self.fallback_fn(sample, self.vae)
+                self._cache[key] = engine
+
+        sample_device = sample.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True)
+
+        with torch.no_grad():
+            mean, logvar = engine(sample_device)
+        std = torch.exp(0.5 * logvar)
+        if generator is None:
+            noise = torch.randn_like(mean)
+        else:
+            noise = torch.randn_like(mean, generator=generator)
+        latents = (mean + std * noise) * self.wrapper.scale
+
+        return latents.to(dtype=self.runtime.compute_dtype, device=self.runtime.device)
+
+
 class _CallableModule(nn.Module):
     def __init__(self, fn):
         super().__init__()

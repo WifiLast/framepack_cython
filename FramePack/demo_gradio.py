@@ -199,7 +199,12 @@ from diffusers_helper.inference import (
     prepare_module_for_inference,
     tensor_core_multiple_for_dtype,
 )
-from diffusers_helper.tensorrt_runtime import TensorRTRuntime, TensorRTLatentDecoder, TensorRTCallable
+from diffusers_helper.tensorrt_runtime import (
+    TensorRTRuntime,
+    TensorRTLatentDecoder,
+    TensorRTLatentEncoder,
+    TensorRTCallable,
+)
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
 except ImportError:
@@ -874,7 +879,7 @@ parser.add_argument(
     "--enable-tensorrt",
     action="store_true",
     default=os.environ.get("FRAMEPACK_ENABLE_TENSORRT", "0") == "1",
-    help="Enable experimental TensorRT acceleration for VAE decoding (requires torch-tensorrt).",
+    help="Enable experimental TensorRT acceleration for VAE encode/decode and CLIP vision (requires torch-tensorrt).",
 )
 args = parser.parse_args()
 
@@ -1313,6 +1318,7 @@ if fp8_buffers_present:
 
 TENSORRT_RUNTIME = None
 TENSORRT_DECODER = None
+TENSORRT_ENCODER = None
 TENSORRT_AVAILABLE = False
 TENSORRT_SIGLIP_ENCODER = None
 if ENABLE_TENSORRT_RUNTIME:
@@ -1325,13 +1331,17 @@ if ENABLE_TENSORRT_RUNTIME:
         )
         if TENSORRT_RUNTIME.is_ready:
             TENSORRT_DECODER = TensorRTLatentDecoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_decode)
+            TENSORRT_ENCODER = TensorRTLatentEncoder(vae, TENSORRT_RUNTIME, fallback_fn=vae_encode)
             TENSORRT_AVAILABLE = True
-            print(f"TensorRT VAE decoder enabled (workspace={TRT_WORKSPACE_MB} MB).")
+            print(f"TensorRT VAE acceleration enabled (workspace={TRT_WORKSPACE_MB} MB).")
         else:
+            TENSORRT_DECODER = None
+            TENSORRT_ENCODER = None
             print(f"TensorRT disabled: {TENSORRT_RUNTIME.failure_reason}")
     except Exception as exc:
         TENSORRT_RUNTIME = None
         TENSORRT_DECODER = None
+        TENSORRT_ENCODER = None
         print(f"Failed to initialize TensorRT runtime: {exc}")
 else:
     print("TensorRT runtime disabled (use --enable-tensorrt to opt-in).")
@@ -1778,10 +1788,16 @@ def worker(
 
     job_id = generate_timestamp()
     decoder_impl = None
-    if use_tensorrt_decode and TENSORRT_AVAILABLE and TENSORRT_DECODER is not None:
-        decoder_impl = TENSORRT_DECODER.decode
-        print("TensorRT decoder engaged for this job.")
-        print("Note: TensorRT will compile separate engines for each unique chunk shape, which may cause slowdowns on first use.")
+    encoder_impl = None
+    if use_tensorrt_decode and TENSORRT_AVAILABLE:
+        if TENSORRT_ENCODER is not None:
+            encoder_impl = TENSORRT_ENCODER
+        if TENSORRT_DECODER is not None:
+            decoder_impl = TENSORRT_DECODER.decode
+        if encoder_impl is not None or decoder_impl is not None:
+            print("TensorRT VAE acceleration engaged for this job.")
+        if decoder_impl is not None:
+            print("Note: TensorRT will compile separate engines for each unique chunk shape, which may cause slowdowns on first use.")
     transformer_backbone = getattr(transformer, "module", None)
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer)
@@ -1867,7 +1883,11 @@ def worker(
             load_model_as_complete(vae, target_device=gpu)
 
         with inference_autocast():
-            start_latent = vae_encode(input_image_pt, vae).to(dtype=MODEL_COMPUTE_DTYPE)
+            if encoder_impl is not None:
+                start_latent = encoder_impl.encode(input_image_pt)
+            else:
+                start_latent = vae_encode(input_image_pt, vae)
+        start_latent = start_latent.to(dtype=MODEL_COMPUTE_DTYPE)
 
         # CLIP Vision
 
@@ -2196,10 +2216,10 @@ with block:
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
                 tensorrt_decode_checkbox = gr.Checkbox(
-                    label="TensorRT VAE Decode (beta)",
+                    label="TensorRT VAE Acceleration (beta)",
                     value=TENSORRT_AVAILABLE,
                     visible=TENSORRT_AVAILABLE,
-                    info="Requires torch-tensorrt + CUDA. Falls back automatically if unsupported.",
+                    info="Requires torch-tensorrt + CUDA. Speeds up both VAE encode/decode and falls back automatically if unsupported.",
                 )
 
         with gr.Column(scale=1, min_width=360):
