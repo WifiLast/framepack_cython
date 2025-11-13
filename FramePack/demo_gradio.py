@@ -204,6 +204,7 @@ from diffusers_helper.tensorrt_runtime import (
     TensorRTLatentDecoder,
     TensorRTLatentEncoder,
     TensorRTCallable,
+    TensorRTTransformer,
 )
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
@@ -881,6 +882,12 @@ parser.add_argument(
     default=os.environ.get("FRAMEPACK_ENABLE_TENSORRT", "0") == "1",
     help="Enable experimental TensorRT acceleration for VAE encode/decode and CLIP vision (requires torch-tensorrt).",
 )
+parser.add_argument(
+    "--tensorrt-transformer",
+    action="store_true",
+    default=os.environ.get("FRAMEPACK_TRT_TRANSFORMER", "0") == "1",
+    help="Enable TensorRT acceleration for transformer model (experimental, requires --enable-tensorrt).",
+)
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -904,6 +911,8 @@ VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.5"))
 VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "8")))
 TRT_WORKSPACE_MB = int(os.environ.get("FRAMEPACK_TRT_WORKSPACE_MB", "4096"))
 TRT_MAX_AUX_STREAMS = int(os.environ.get("FRAMEPACK_TRT_MAX_AUX_STREAMS", "2"))
+TRT_TRANSFORMER_ENABLED = args.tensorrt_transformer
+TRT_MAX_CACHED_SHAPES = int(os.environ.get("FRAMEPACK_TRT_MAX_CACHED_SHAPES", "8"))
 ENABLE_TENSORRT_RUNTIME = args.enable_tensorrt
 
 memory_backend = memory_v2 if args.use_memory_v2 else memory_v1
@@ -1346,6 +1355,7 @@ if ENABLE_TENSORRT_RUNTIME:
 else:
     print("TensorRT runtime disabled (use --enable-tensorrt to opt-in).")
 
+TENSORRT_TRANSFORMER = None
 if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
     def _siglip_forward(pixel_values):
         return image_encoder(pixel_values=pixel_values)
@@ -1356,6 +1366,23 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
         forward_fn=_siglip_forward,
     )
     setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
+
+    # Initialize TensorRT transformer wrapper if enabled
+    if TRT_TRANSFORMER_ENABLED:
+        try:
+            print(f"Initializing TensorRT transformer wrapper (max_cached_shapes={TRT_MAX_CACHED_SHAPES})...")
+            TENSORRT_TRANSFORMER = TensorRTTransformer(
+                transformer_core,
+                TENSORRT_RUNTIME,
+                fallback_fn=None,
+            )
+            TENSORRT_TRANSFORMER._max_cached_shapes = TRT_MAX_CACHED_SHAPES
+            print("TensorRT transformer wrapper initialized. Engines will compile on first use per shape.")
+        except Exception as exc:
+            print(f"Failed to initialize TensorRT transformer: {exc}")
+            TENSORRT_TRANSFORMER = None
+    else:
+        print("TensorRT transformer disabled (set FRAMEPACK_TRT_TRANSFORMER=1 to enable).")
 
 if ENABLE_FP8 and optimize_state_dict_with_fp8 is not None and apply_fp8_monkey_patch is not None:
     if FP8_TRANSFORMER_ACTIVE:
@@ -1776,6 +1803,7 @@ def worker(
     mp4_crf,
     quality_mode=False,
     use_tensorrt_decode=False,
+    use_tensorrt_transformer=False,
 ):
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
@@ -1789,6 +1817,8 @@ def worker(
     job_id = generate_timestamp()
     decoder_impl = None
     encoder_impl = None
+    transformer_impl = transformer
+
     if use_tensorrt_decode and TENSORRT_AVAILABLE:
         if TENSORRT_ENCODER is not None:
             encoder_impl = TENSORRT_ENCODER
@@ -1798,9 +1828,17 @@ def worker(
             print("TensorRT VAE acceleration engaged for this job.")
         if decoder_impl is not None:
             print("Note: TensorRT will compile separate engines for each unique chunk shape, which may cause slowdowns on first use.")
-    transformer_backbone = getattr(transformer, "module", None)
+
+    if use_tensorrt_transformer and TENSORRT_TRANSFORMER is not None:
+        transformer_impl = TENSORRT_TRANSFORMER
+        print("TensorRT transformer acceleration engaged for this job.")
+        print("Note: TensorRT will compile transformer engines on first use per shape, which may take several minutes.")
+
+    transformer_backbone = getattr(transformer_impl, "module", None)
     if transformer_backbone is None:
-        transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer)
+        transformer_backbone = getattr(transformer_impl, "transformer", None)
+    if transformer_backbone is None:
+        transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer_impl)
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
@@ -1954,7 +1992,9 @@ def worker(
 
             if not high_vram and not USE_FSDP:
                 unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                # For TensorRT transformer, move the underlying transformer
+                transformer_to_move = transformer_backbone if use_tensorrt_transformer else transformer
+                move_model_to_device_with_memory_preservation(transformer_to_move, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
                 transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.2)
@@ -1982,7 +2022,7 @@ def worker(
 
             with inference_autocast():
                 generated_latents = sample_hunyuan(
-                    transformer=transformer,
+                    transformer=transformer_impl,
                     sampler='unipc',
                     width=width,
                     height=height,
@@ -2111,6 +2151,7 @@ def process(
     mp4_crf,
     quality_mode,
     use_tensorrt_decode,
+    use_tensorrt_transformer,
 ):
     global stream
     assert input_image is not None, 'No input image!'
@@ -2138,6 +2179,7 @@ def process(
         mp4_crf,
         quality_mode,
         use_tensorrt_decode,
+        use_tensorrt_transformer,
     )
 
     output_filename = None
@@ -2221,6 +2263,12 @@ with block:
                     visible=TENSORRT_AVAILABLE,
                     info="Requires torch-tensorrt + CUDA. Speeds up both VAE encode/decode and falls back automatically if unsupported.",
                 )
+                tensorrt_transformer_checkbox = gr.Checkbox(
+                    label="TensorRT Transformer Acceleration (experimental)",
+                    value=False,
+                    visible=TENSORRT_TRANSFORMER is not None,
+                    info="Requires torch-tensorrt + CUDA. Compiles transformer on first use (takes ~5-10min), then provides significant speedup. Experimental feature.",
+                )
 
         with gr.Column(scale=1, min_width=360):
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
@@ -2255,6 +2303,7 @@ with block:
         mp4_crf,
         quality_mode,
         tensorrt_decode_checkbox,
+        tensorrt_transformer_checkbox,
     ]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)

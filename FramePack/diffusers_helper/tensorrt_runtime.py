@@ -272,3 +272,245 @@ class TensorRTCallable:
             arg.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True) for arg in args
         )
         return self._compiled(*runtime_args, **kwargs)
+
+
+class TransformerWrapper(nn.Module):
+    """Wrapper to expose transformer forward as a single module for TensorRT."""
+
+    def __init__(self, transformer: nn.Module):
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        pooled_projections: torch.Tensor,
+        guidance: torch.Tensor,
+        latent_indices: torch.Tensor,
+        clean_latents: torch.Tensor,
+        clean_latent_indices: torch.Tensor,
+        clean_latents_2x: torch.Tensor,
+        clean_latent_2x_indices: torch.Tensor,
+        clean_latents_4x: torch.Tensor,
+        clean_latent_4x_indices: torch.Tensor,
+        image_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass through transformer with all required inputs."""
+        output = self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            pooled_projections=pooled_projections,
+            guidance=guidance,
+            latent_indices=latent_indices,
+            clean_latents=clean_latents,
+            clean_latent_indices=clean_latent_indices,
+            clean_latents_2x=clean_latents_2x,
+            clean_latent_2x_indices=clean_latent_2x_indices,
+            clean_latents_4x=clean_latents_4x,
+            clean_latent_4x_indices=clean_latent_4x_indices,
+            image_embeddings=image_embeddings,
+            attention_kwargs={},
+            return_dict=False,
+        )
+        # Return the first element if it's a tuple
+        if isinstance(output, tuple):
+            return output[0]
+        return output
+
+
+class TensorRTTransformer:
+    """TensorRT wrapper for transformer models with dynamic shape caching."""
+
+    def __init__(self, transformer: nn.Module, runtime: TensorRTRuntime, fallback_fn=None):
+        self.transformer = transformer
+        self.runtime = runtime
+        self.fallback_fn = fallback_fn
+        self.wrapper = TransformerWrapper(transformer)
+        self._cache: Dict[Tuple[int, ...], nn.Module] = {}
+        self._lock = threading.Lock()
+        self._compile_count = 0
+        self._max_cached_shapes = 8  # Limit number of cached engine shapes
+
+    def _shape_key(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_embeddings: torch.Tensor,
+    ) -> Tuple[int, ...]:
+        """Generate cache key from input shapes."""
+        return (
+            tuple(hidden_states.shape),
+            tuple(encoder_hidden_states.shape),
+            tuple(image_embeddings.shape),
+        )
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        pooled_projections: torch.Tensor,
+        guidance: torch.Tensor,
+        latent_indices: torch.Tensor,
+        clean_latents: torch.Tensor,
+        clean_latent_indices: torch.Tensor,
+        clean_latents_2x: torch.Tensor,
+        clean_latent_2x_indices: torch.Tensor,
+        clean_latents_4x: torch.Tensor,
+        clean_latent_4x_indices: torch.Tensor,
+        image_embeddings: torch.Tensor,
+        attention_kwargs=None,
+        return_dict: bool = False,
+    ):
+        """Execute transformer with optional TensorRT acceleration."""
+        if not self.runtime.is_ready:
+            if self.fallback_fn is not None:
+                return self.fallback_fn(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    pooled_projections=pooled_projections,
+                    guidance=guidance,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    image_embeddings=image_embeddings,
+                    attention_kwargs=attention_kwargs or {},
+                    return_dict=return_dict,
+                )
+            return self.transformer(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                pooled_projections=pooled_projections,
+                guidance=guidance,
+                latent_indices=latent_indices,
+                clean_latents=clean_latents,
+                clean_latent_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x,
+                clean_latent_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x,
+                clean_latent_4x_indices=clean_latent_4x_indices,
+                image_embeddings=image_embeddings,
+                attention_kwargs=attention_kwargs or {},
+                return_dict=return_dict,
+            )
+
+        # Get shape-specific engine
+        key = self._shape_key(hidden_states, encoder_hidden_states, image_embeddings)
+
+        with self._lock:
+            engine = self._cache.get(key)
+            if engine is None:
+                # Limit cache size
+                if len(self._cache) >= self._max_cached_shapes:
+                    # Remove oldest entry
+                    oldest_key = next(iter(self._cache))
+                    del self._cache[oldest_key]
+                    print(f"TensorRT transformer cache full, evicted shape: {oldest_key}")
+
+                # Compile new engine for this shape
+                print(f"Compiling TensorRT transformer engine for shape: {key}")
+                try:
+                    # Create input specs for all inputs
+                    input_specs = [
+                        self.runtime.make_input_from_shape(hidden_states.shape, name="hidden_states"),
+                        self.runtime.make_input_from_shape(timestep.shape, name="timestep"),
+                        self.runtime.make_input_from_shape(encoder_hidden_states.shape, name="encoder_hidden_states"),
+                        self.runtime.make_input_from_shape(encoder_attention_mask.shape, name="encoder_attention_mask"),
+                        self.runtime.make_input_from_shape(pooled_projections.shape, name="pooled_projections"),
+                        self.runtime.make_input_from_shape(guidance.shape, name="guidance"),
+                        self.runtime.make_input_from_shape(latent_indices.shape, name="latent_indices"),
+                        self.runtime.make_input_from_shape(clean_latents.shape, name="clean_latents"),
+                        self.runtime.make_input_from_shape(clean_latent_indices.shape, name="clean_latent_indices"),
+                        self.runtime.make_input_from_shape(clean_latents_2x.shape, name="clean_latents_2x"),
+                        self.runtime.make_input_from_shape(clean_latent_2x_indices.shape, name="clean_latent_2x_indices"),
+                        self.runtime.make_input_from_shape(clean_latents_4x.shape, name="clean_latents_4x"),
+                        self.runtime.make_input_from_shape(clean_latent_4x_indices.shape, name="clean_latent_4x_indices"),
+                        self.runtime.make_input_from_shape(image_embeddings.shape, name="image_embeddings"),
+                    ]
+
+                    engine = self.runtime.get_or_compile(
+                        f"transformer_{self._compile_count}",
+                        self.wrapper,
+                        input_specs=input_specs,
+                    )
+                    self._compile_count += 1
+                    self._cache[key] = engine
+                    print(f"TensorRT transformer compilation successful")
+                except Exception as exc:
+                    print(f"TensorRT transformer compilation failed: {exc}")
+                    # Fall back to original implementation
+                    if self.fallback_fn is not None:
+                        return self.fallback_fn(
+                            hidden_states=hidden_states,
+                            timestep=timestep,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_attention_mask=encoder_attention_mask,
+                            pooled_projections=pooled_projections,
+                            guidance=guidance,
+                            latent_indices=latent_indices,
+                            clean_latents=clean_latents,
+                            clean_latent_indices=clean_latent_indices,
+                            clean_latents_2x=clean_latents_2x,
+                            clean_latent_2x_indices=clean_latent_2x_indices,
+                            clean_latents_4x=clean_latents_4x,
+                            clean_latent_4x_indices=clean_latent_4x_indices,
+                            image_embeddings=image_embeddings,
+                            attention_kwargs=attention_kwargs or {},
+                            return_dict=return_dict,
+                        )
+                    return self.transformer(
+                        hidden_states=hidden_states,
+                        timestep=timestep,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        pooled_projections=pooled_projections,
+                        guidance=guidance,
+                        latent_indices=latent_indices,
+                        clean_latents=clean_latents,
+                        clean_latent_indices=clean_latent_indices,
+                        clean_latents_2x=clean_latents_2x,
+                        clean_latent_2x_indices=clean_latent_2x_indices,
+                        clean_latents_4x=clean_latents_4x,
+                        clean_latent_4x_indices=clean_latent_4x_indices,
+                        image_embeddings=image_embeddings,
+                        attention_kwargs=attention_kwargs or {},
+                        return_dict=return_dict,
+                    )
+
+        # Execute with TensorRT engine
+        with torch.no_grad():
+            output = engine(
+                hidden_states.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                timestep.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                encoder_hidden_states.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                encoder_attention_mask.to(device=self.runtime.device, non_blocking=True),
+                pooled_projections.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                guidance.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                latent_indices.to(device=self.runtime.device, non_blocking=True),
+                clean_latents.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                clean_latent_indices.to(device=self.runtime.device, non_blocking=True),
+                clean_latents_2x.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                clean_latent_2x_indices.to(device=self.runtime.device, non_blocking=True),
+                clean_latents_4x.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+                clean_latent_4x_indices.to(device=self.runtime.device, non_blocking=True),
+                image_embeddings.to(device=self.runtime.device, dtype=self.runtime.compute_dtype, non_blocking=True),
+            )
+
+        if return_dict:
+            # Wrap in appropriate return type if needed
+            return type('Output', (), {'sample': output})()
+        return (output,) if isinstance(output, torch.Tensor) else output
