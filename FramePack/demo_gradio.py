@@ -1089,6 +1089,10 @@ FP8_TARGET_LAYER_KEYS = _parse_csv_env("FRAMEPACK_FP8_TARGET_KEYS")
 FP8_EXCLUDE_LAYER_KEYS = _parse_csv_env("FRAMEPACK_FP8_EXCLUDE_KEYS")
 FP8_USE_SCALED_MM = os.environ.get("FRAMEPACK_FP8_USE_SCALED_MM", "0") == "1"
 FP8_TRANSFORMER_ACTIVE = False
+SLOW_MOTION_HINT = os.environ.get(
+    "FRAMEPACK_SLOW_PROMPT_HINT",
+    "move slowly, slow motion, gentle pacing, graceful deliberate movements",
+)
 
 
 MODULE_CACHE_WRAPPERS: List[ModuleCacheWrapper] = []
@@ -1147,6 +1151,19 @@ def wrap_with_module_cache(
         semantic_threshold=semantic_threshold,
     )
     return register_cache_wrapper(wrapper)
+
+
+def _apply_prompt_hint(text: str, hint: str) -> str:
+    base = (text or "").strip()
+    hint = (hint or "").strip()
+    if not hint:
+        return base
+    if hint.lower() in base.lower():
+        return base
+    if not base:
+        return hint
+    separator = ", " if not base.endswith((",", ";")) else " "
+    return f"{base}{separator}{hint}"
 
 
 def make_text_semantic_embedder(tokenizer, *, buckets: int = 768):
@@ -1668,7 +1685,7 @@ def vae_decode_chunked(latents, vae, chunk_size=None, quality_mode=False):
 
 
 @torch.inference_mode()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode=False):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode=False):
     runtime_cache_mode = (cache_mode or CACHE_MODE).lower()
     set_cache_mode_for_wrappers(runtime_cache_mode)
     latent_window_size = align_to_multiple(latent_window_size, multiple=8, minimum=8)
@@ -1701,8 +1718,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
+        active_prompt = prompt
+        if slow_prompt_hint:
+            active_prompt = _apply_prompt_hint(active_prompt, SLOW_MOTION_HINT)
+            print(f'Applied slow-motion hint to prompt: "{SLOW_MOTION_HINT}".')
+
         with inference_autocast():
-            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec, clip_l_pooler = encode_prompt_conds(active_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
@@ -1955,7 +1977,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -1963,7 +1985,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode, mp4_crf, quality_mode)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode, mp4_crf, quality_mode)
 
     output_filename = None
 
@@ -2011,6 +2033,11 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                slow_prompt_hint = gr.Checkbox(
+                    label='Add "move slowly" hint',
+                    value=True,
+                    info='Appends a slow-motion phrasing to your prompt to encourage smoother motion.',
+                )
                 quality_mode = gr.Checkbox(label='Quality Mode (Better Hands)', value=False, info='Uses larger VAE chunks (2-4 frames) for better quality, especially for hands. Requires more VRAM.')
                 cache_mode_selector = gr.Radio(
                     label='Cache Mode',
@@ -2048,7 +2075,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, cache_mode_selector, mp4_crf, quality_mode]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, slow_prompt_hint, cache_mode_selector, mp4_crf, quality_mode]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
