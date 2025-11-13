@@ -1,15 +1,44 @@
+# Core Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
 accelerate==1.6.0
 diffusers==0.33.1
 transformers==4.46.2
+
+# UI
 gradio==5.23.0
-sentencepiece==0.2.0
+
+# Media Processing
 pillow==11.1.0
 av==12.1.0
+opencv-contrib-python
+
+# Utilities
 numpy==1.26.2
 scipy==1.12.0
+einops
+safetensors
+sentencepiece==0.2.0
 requests==2.31.0
 torchsde==0.2.6
 
-einops
-opencv-contrib-python
-safetensors
+# Optional: Performance Optimizations
+xformers>=0.0.20  # Recommended for attention optimization
+bitsandbytes>=0.41.0  # For 4-bit quantization (BNB)
+
+# Optional: Advanced Attention Backends
+# flash-attn>=2.0.0  # Flash Attention (may conflict with TensorRT)
+# sageattention  # Sage Attention backend
+
+# Optional: TensorRT Acceleration (experimental)
+# torch-tensorrt  # Requires CUDA toolkit and compatible PyTorch version
+# Installation: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Optional: FAISS for semantic caching
+# faiss-cpu  # CPU version
+# faiss-gpu  # GPU version (faster, requires CUDA)
+
+# Development Dependencies (optional)
+# pytest
+# black
+# ruff

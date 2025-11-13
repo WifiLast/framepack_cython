@@ -1,0 +1,26 @@
+# Optional Performance Optimizations
+# Install these for enhanced performance
+
+# Attention Backends (choose one or more)
+xformers>=0.0.20  # Recommended - works with most GPUs
+# flash-attn>=2.0.0  # Hopper GPUs (H100, etc.) - may conflict with TensorRT
+# sageattention  # Alternative attention backend
+
+# Quantization
+bitsandbytes>=0.41.0  # 4-bit/8-bit model quantization (reduces VRAM usage)
+
+# TensorRT (GPU acceleration for inference)
+# Requires: CUDA toolkit, compatible PyTorch, and torch-tensorrt
+# Installation:
+#   CUDA 12.1: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu121
+#   CUDA 11.8: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu118
+# torch-tensorrt
+
+# Semantic Caching (FAISS)
+# Choose CPU or GPU version based on your setup
+# faiss-cpu  # CPU version (slower but works everywhere)
+# faiss-gpu  # GPU version (faster, requires CUDA)
+
+# FP8 Optimizations (experimental)
+# Requires compatible GPU (Ada Lovelace, Hopper, or newer)
+# transformer-engine  # NVIDIA Transformer Engine for FP8
