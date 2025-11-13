@@ -146,11 +146,11 @@ class TensorRTLatentDecoder:
             if engine is None:
                 input_spec = self.runtime.make_input_from_shape(tuple(latents.shape), name="latents")
                 try:
-                engine = self.runtime.get_or_compile(
-                    f"vae_decode_{key}",
-                    self.wrapper,
-                    input_specs=[input_spec],
-                )
+                    engine = self.runtime.get_or_compile(
+                        f"vae_decode_{key}",
+                        self.wrapper,
+                        input_specs=[input_spec],
+                    )
                 except Exception:
                     return self.fallback_fn(latents, self.vae)
                 self._cache[key] = engine
