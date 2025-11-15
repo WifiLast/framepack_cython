@@ -199,8 +199,10 @@ class TensorRTRuntime:
                 else:
                     raise ValueError("Either input_specs or example_inputs must be provided for TensorRT compile.")
             except Exception as exc:  # pragma: no cover - CUDA/TensorRT failure surface
-                self.disable(f"TensorRT compilation failed for {name}: {exc}")
-                raise
+                print(f"WARNING: TensorRT compilation failed for {name}: {exc}")
+                print(f"         This component will fall back to PyTorch. Other TensorRT components remain active.")
+                # Don't disable entire runtime - just return None and let the component fall back
+                return None
 
             # Save to both memory and disk cache
             self._modules[name] = compiled
@@ -695,14 +697,13 @@ class TensorRTTextEncoder:
             if engine is None:
                 input_id_spec = self.runtime.make_input_from_shape(tuple(input_ids.shape), name="input_ids")
                 attention_mask_spec = self.runtime.make_input_from_shape(tuple(attention_mask.shape), name="attention_mask")
-                try:
-                    engine = self.runtime.get_or_compile(
-                        f"llama_text_encoder_{key}",
-                        self.wrapper,
-                        input_specs=[input_id_spec, attention_mask_spec],
-                    )
-                except Exception:
-                    # Fallback on compilation failure
+                engine = self.runtime.get_or_compile(
+                    f"llama_text_encoder_{key}",
+                    self.wrapper,
+                    input_specs=[input_id_spec, attention_mask_spec],
+                )
+                if engine is None:
+                    # Compilation failed - fall back to PyTorch
                     if self.fallback_fn is not None:
                         return self.fallback_fn(input_ids, attention_mask, crop_start, attention_length)
                     outputs = self.text_encoder(
@@ -762,14 +763,13 @@ class TensorRTCLIPTextEncoder:
             engine = self._cache.get(key)
             if engine is None:
                 input_spec = self.runtime.make_input_from_shape(tuple(input_ids.shape), name="input_ids")
-                try:
-                    engine = self.runtime.get_or_compile(
-                        f"clip_text_encoder_{key}",
-                        self.wrapper,
-                        input_specs=[input_spec],
-                    )
-                except Exception:
-                    # Fallback on compilation failure
+                engine = self.runtime.get_or_compile(
+                    f"clip_text_encoder_{key}",
+                    self.wrapper,
+                    input_specs=[input_spec],
+                )
+                if engine is None:
+                    # Compilation failed - fall back to PyTorch
                     if self.fallback_fn is not None:
                         return self.fallback_fn(input_ids)
                     outputs = self.text_encoder(input_ids, output_hidden_states=False)
