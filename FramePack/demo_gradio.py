@@ -2218,23 +2218,23 @@ def worker(
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-    chunk_index = 0
-    for latent_padding in latent_paddings:
-        is_last_section = latent_padding == 0
-        latent_padding_size = latent_padding * latent_window_size
+        chunk_index = 0
+        for latent_padding in latent_paddings:
+            is_last_section = latent_padding == 0
+            latent_padding_size = latent_padding * latent_window_size
 
-        if stream.input_queue.top() == 'end':
-            stream.output_queue.push(('end', None))
-            return
+            if stream.input_queue.top() == 'end':
+                stream.output_queue.push(('end', None))
+                return
 
-        print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
+            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
 
-        start_video_frames = max(0, total_generated_latent_frames * 4 - 3)
-        cache_event_recorder.start_chunk(
-            start_frame=start_video_frames,
-            steps=steps,
-            label=f"chunk_{chunk_index}",
-        )
+            start_video_frames = max(0, total_generated_latent_frames * 4 - 3)
+            cache_event_recorder.start_chunk(
+                start_frame=start_video_frames,
+                steps=steps,
+                label=f"chunk_{chunk_index}",
+            )
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
