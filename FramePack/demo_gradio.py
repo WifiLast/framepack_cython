@@ -208,6 +208,7 @@ from diffusers_helper.tensorrt_runtime import (
     TensorRTTextEncoder,
     TensorRTCLIPTextEncoder,
 )
+from diffusers_helper.cache_events import CacheEventRecorder
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
 except ImportError:
@@ -1095,15 +1096,18 @@ CPU_PREPROCESS_ACCEL = cpu_preprocessing_active()
 if CPU_PREPROCESS_ACCEL:
     print('CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).')
 ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "0") == "1") and not args.disable_fbcache
+CURRENT_FBCACHE_ENABLED = ENABLE_FBCACHE
 FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035"))
 FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
 ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "0") == "1") and not args.disable_sim_cache
+CURRENT_SIM_CACHE_ENABLED = ENABLE_SIM_CACHE
 SIM_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SIM_CACHE_THRESHOLD", "0.9"))
 SIM_CACHE_MAX_SKIP = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_SKIP", "1"))
 SIM_CACHE_MAX_ENTRIES = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_ENTRIES", "12"))
 SIM_CACHE_USE_FAISS = os.environ.get("FRAMEPACK_SIM_CACHE_USE_FAISS", "0") == "1"
 SIM_CACHE_VERBOSE = os.environ.get("FRAMEPACK_SIM_CACHE_VERBOSE", "0") == "1"
 ENABLE_KV_CACHE = (os.environ.get("FRAMEPACK_ENABLE_KV_CACHE", "0") == "1") and not args.disable_kv_cache
+CURRENT_KV_CACHE_ENABLED = ENABLE_KV_CACHE
 KV_CACHE_LENGTH = int(os.environ.get("FRAMEPACK_KV_CACHE_LEN", "4096"))
 KV_CACHE_VERBOSE = os.environ.get("FRAMEPACK_KV_CACHE_VERBOSE", "0") == "1"
 XFORMERS_MODE = (args.xformers_mode or os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard")).lower()
@@ -1576,8 +1580,10 @@ if ENABLE_FBCACHE:
     if fb_state:
         transformer_core.first_block_cache.load_state_dict(fb_state)
         print('Loaded persisted first-block cache state.')
+    CURRENT_FBCACHE_ENABLED = True
 else:
     transformer_core.enable_first_block_cache(enabled=False)
+    CURRENT_FBCACHE_ENABLED = False
 
 if ENABLE_SIM_CACHE:
     transformer_core.enable_similarity_cache(
@@ -1596,8 +1602,10 @@ if ENABLE_SIM_CACHE:
     if sim_state and transformer_core.similarity_cache_manager is not None:
         transformer_core.similarity_cache_manager.load_state_dict(sim_state)
         print('Loaded persisted similarity cache state.')
+    CURRENT_SIM_CACHE_ENABLED = True
 else:
     transformer_core.enable_similarity_cache(enabled=False)
+    CURRENT_SIM_CACHE_ENABLED = False
 
 if ENABLE_KV_CACHE:
     transformer_core.enable_kv_cache(
@@ -1610,8 +1618,10 @@ if ENABLE_KV_CACHE:
     if kv_state and transformer_core.kv_cache_manager is not None:
         transformer_core.kv_cache_manager.load_state_dict(kv_state)
         print('Loaded persisted KV cache state.')
+    CURRENT_KV_CACHE_ENABLED = True
 else:
     transformer_core.enable_kv_cache(enabled=False)
+    CURRENT_KV_CACHE_ENABLED = False
 
 
 def _persist_runtime_caches_on_exit():
@@ -1620,15 +1630,15 @@ def _persist_runtime_caches_on_exit():
     core = globals().get("TRANSFORMER_BACKBONE") or globals().get("transformer_core")
     if core is None:
         return
-    if ENABLE_FBCACHE:
+    if CURRENT_FBCACHE_ENABLED:
         fb_cache = getattr(core, "first_block_cache", None)
         if fb_cache is not None:
             _save_runtime_cache_state("first_block_cache", fb_cache.state_dict())
-    if ENABLE_SIM_CACHE:
+    if CURRENT_SIM_CACHE_ENABLED:
         sim_manager = getattr(core, "similarity_cache_manager", None)
         if sim_manager is not None:
             _save_runtime_cache_state("similarity_cache", sim_manager.state_dict())
-    if ENABLE_KV_CACHE:
+    if CURRENT_KV_CACHE_ENABLED:
         kv_manager = getattr(core, "kv_cache_manager", None)
         if kv_manager is not None:
             _save_runtime_cache_state("kv_cache", kv_manager.state_dict())
@@ -1955,6 +1965,9 @@ def worker(
     rs,
     gpu_memory_preservation,
     use_teacache,
+    use_fb_cache,
+    use_sim_cache,
+    use_kv_cache,
     slow_prompt_hint,
     cache_mode,
     mp4_crf,
@@ -2005,6 +2018,65 @@ def worker(
         transformer_backbone = getattr(transformer_impl, "transformer", None)
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer_impl)
+
+    cache_event_recorder = CacheEventRecorder()
+    cache_event_recorder.reset()
+    if hasattr(transformer_backbone, "set_cache_event_recorder"):
+        transformer_backbone.set_cache_event_recorder(cache_event_recorder)
+
+    desired_fb_cache_state = bool(use_fb_cache)
+    global CURRENT_FBCACHE_ENABLED, CURRENT_SIM_CACHE_ENABLED, CURRENT_KV_CACHE_ENABLED
+    if hasattr(transformer_backbone, "enable_first_block_cache") and desired_fb_cache_state != CURRENT_FBCACHE_ENABLED:
+        transformer_backbone.enable_first_block_cache(
+            enabled=desired_fb_cache_state,
+            threshold=FBCACHE_THRESHOLD,
+            verbose=FBCACHE_VERBOSE,
+        )
+        if desired_fb_cache_state:
+            fb_state = _load_runtime_cache_state("first_block_cache")
+            if fb_state and hasattr(transformer_backbone, "first_block_cache"):
+                transformer_backbone.first_block_cache.load_state_dict(fb_state)
+            print("First block cache enabled for this job.")
+        else:
+            print("First block cache disabled for this job.")
+        CURRENT_FBCACHE_ENABLED = desired_fb_cache_state
+
+    desired_sim_cache_state = bool(use_sim_cache)
+    if hasattr(transformer_backbone, "enable_similarity_cache") and desired_sim_cache_state != CURRENT_SIM_CACHE_ENABLED:
+        if desired_sim_cache_state:
+            transformer_backbone.enable_similarity_cache(
+                enabled=True,
+                threshold=SIM_CACHE_THRESHOLD,
+                max_skip=SIM_CACHE_MAX_SKIP,
+                max_entries=SIM_CACHE_MAX_ENTRIES,
+                use_faiss=SIM_CACHE_USE_FAISS,
+                verbose=SIM_CACHE_VERBOSE,
+            )
+            sim_state = _load_runtime_cache_state("similarity_cache")
+            if sim_state and getattr(transformer_backbone, "similarity_cache_manager", None) is not None:
+                transformer_backbone.similarity_cache_manager.load_state_dict(sim_state)
+            print("Similarity cache enabled for this job.")
+        else:
+            transformer_backbone.enable_similarity_cache(enabled=False)
+            print("Similarity cache disabled for this job.")
+        CURRENT_SIM_CACHE_ENABLED = desired_sim_cache_state
+
+    desired_kv_cache_state = bool(use_kv_cache)
+    if hasattr(transformer_backbone, "enable_kv_cache") and desired_kv_cache_state != CURRENT_KV_CACHE_ENABLED:
+        if desired_kv_cache_state:
+            transformer_backbone.enable_kv_cache(
+                enabled=True,
+                max_length=KV_CACHE_LENGTH,
+                verbose=KV_CACHE_VERBOSE,
+            )
+            kv_state = _load_runtime_cache_state("kv_cache")
+            if kv_state and getattr(transformer_backbone, "kv_cache_manager", None) is not None:
+                transformer_backbone.kv_cache_manager.load_state_dict(kv_state)
+            print("KV cache enabled for this job.")
+        else:
+            transformer_backbone.enable_kv_cache(enabled=False)
+            print("KV cache disabled for this job.")
+        CURRENT_KV_CACHE_ENABLED = desired_kv_cache_state
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
@@ -2146,15 +2218,23 @@ def worker(
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-        for latent_padding in latent_paddings:
-            is_last_section = latent_padding == 0
-            latent_padding_size = latent_padding * latent_window_size
+    chunk_index = 0
+    for latent_padding in latent_paddings:
+        is_last_section = latent_padding == 0
+        latent_padding_size = latent_padding * latent_window_size
 
-            if stream.input_queue.top() == 'end':
-                stream.output_queue.push(('end', None))
-                return
+        if stream.input_queue.top() == 'end':
+            stream.output_queue.push(('end', None))
+            return
 
-            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
+        print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
+
+        start_video_frames = max(0, total_generated_latent_frames * 4 - 3)
+        cache_event_recorder.start_chunk(
+            start_frame=start_video_frames,
+            steps=steps,
+            label=f"chunk_{chunk_index}",
+        )
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
             clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
@@ -2191,6 +2271,7 @@ def worker(
                 percentage = int(100.0 * current_step / steps)
                 hint = f'Sampling {current_step}/{steps}'
                 desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
+                cache_event_recorder.mark_step(current_step)
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
@@ -2231,6 +2312,10 @@ def worker(
 
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+            end_video_frames = max(0, total_generated_latent_frames * 4 - 3)
+            cache_event_recorder.finalize_chunk(end_frame=end_video_frames)
+            stream.output_queue.push(('timeline', cache_event_recorder.to_markdown()))
+            chunk_index += 1
 
             if not high_vram and not USE_FSDP:
                 # Aggressive offloading with synchronization
@@ -2296,6 +2381,7 @@ def worker(
                 break
     except:
         traceback.print_exc()
+        cache_event_recorder.cancel_chunk()
 
         if not high_vram:
             modules_to_unload = [image_encoder, vae, transformer]
@@ -2303,6 +2389,10 @@ def worker(
                 modules_to_unload.extend([text_encoder, text_encoder_2])
             unload_complete_models(*modules_to_unload)
 
+    if hasattr(transformer_backbone, "set_cache_event_recorder"):
+        transformer_backbone.set_cache_event_recorder(None)
+
+    stream.output_queue.push(('timeline', cache_event_recorder.to_markdown()))
     stream.output_queue.push(('end', None))
     return
 
@@ -2320,6 +2410,9 @@ def process(
     rs,
     gpu_memory_preservation,
     use_teacache,
+    use_fb_cache,
+    use_sim_cache,
+    use_kv_cache,
     slow_prompt_hint,
     cache_mode,
     mp4_crf,
@@ -2330,7 +2423,8 @@ def process(
     global stream
     assert input_image is not None, 'No input image!'
 
-    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+    timeline_md = "No cache hits recorded yet."
+    yield None, None, '', '', timeline_md, gr.update(interactive=False), gr.update(interactive=True)
 
     stream = AsyncStream()
 
@@ -2348,6 +2442,9 @@ def process(
         rs,
         gpu_memory_preservation,
         use_teacache,
+        use_fb_cache,
+        use_sim_cache,
+        use_kv_cache,
         slow_prompt_hint,
         cache_mode,
         mp4_crf,
@@ -2363,14 +2460,19 @@ def process(
 
         if flag == 'file':
             output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            yield output_filename, gr.update(), gr.update(), gr.update(), timeline_md, gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'progress':
             preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            yield gr.update(), gr.update(visible=True, value=preview), desc, html, timeline_md, gr.update(interactive=False), gr.update(interactive=True)
+
+        if flag == 'timeline':
+            timeline_md = data or "No cache hits recorded yet."
+            yield gr.update(), gr.update(), gr.update(), gr.update(), timeline_md, gr.update(interactive=False), gr.update(interactive=True)
+            continue
 
         if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            yield output_filename, gr.update(visible=False), gr.update(), '', timeline_md, gr.update(interactive=True), gr.update(interactive=False)
             break
 
 
@@ -2408,6 +2510,21 @@ with block:
 
             with gr.Accordion("Quality & Cache", open=False):
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                use_fb_cache = gr.Checkbox(
+                    label='Use First Block Cache',
+                    value=ENABLE_FBCACHE,
+                    info="Caches the transformer's first block to reuse prompts faster. Disable to save VRAM or avoid stale results.",
+                )
+                use_sim_cache = gr.Checkbox(
+                    label='Use Similarity Cache',
+                    value=ENABLE_SIM_CACHE,
+                    info='Reuses similar frames via FAISS-backed cache. Disable if it causes artifacts or to save VRAM.',
+                )
+                use_kv_cache = gr.Checkbox(
+                    label='Use KV Cache',
+                    value=ENABLE_KV_CACHE,
+                    info='Keeps transformer KV states for reuse. Disable for lower memory usage.',
+                )
                 quality_mode = gr.Checkbox(label='Quality Mode (Better Hands)', value=False, info='Uses larger VAE chunks (2-4 frames) for better quality, especially for hands. Requires more VRAM.')
                 cache_mode_selector = gr.Radio(
                     label='Cache Mode',
@@ -2456,6 +2573,7 @@ with block:
             with gr.Accordion("Status", open=True):
                 progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
                 progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+                cache_timeline_md = gr.Markdown('No cache hits recorded yet.')
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
@@ -2472,6 +2590,9 @@ with block:
         rs,
         gpu_memory_preservation,
         use_teacache,
+        use_fb_cache,
+        use_sim_cache,
+        use_kv_cache,
         slow_prompt_hint,
         cache_mode_selector,
         mp4_crf,
@@ -2479,7 +2600,7 @@ with block:
         tensorrt_decode_checkbox,
         tensorrt_transformer_checkbox,
     ]
-    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, cache_timeline_md, start_button, end_button])
     end_button.click(fn=end_process)
 
 

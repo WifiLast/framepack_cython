@@ -22,6 +22,7 @@ from diffusers_helper.similarity_cache import (
     SimilarityCacheConfig,
     SimilarityCacheManager,
 )
+from diffusers_helper.cache_events import CacheEventRecorder
 from diffusers_helper.kv_cache import (
     KVCachingConfig,
     KVCachingManager,
@@ -855,6 +856,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self._sim_cache_step = 0
         self.kv_cache_enabled = False
         self.kv_cache_manager: Optional[KVCachingManager] = None
+        self.cache_event_recorder: Optional[CacheEventRecorder] = None
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -872,10 +874,12 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             else:
                 self.first_block_cache.update_config(config)
             self.enable_fbcache = True
+            self._update_fbcache_callback()
         else:
             self.enable_fbcache = False
             if self.first_block_cache is not None:
                 self.first_block_cache.reset()
+                self.first_block_cache.register_hit_callback(None)
 
     def enable_similarity_cache(
         self,
@@ -942,6 +946,30 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         )
         self.kv_cache_manager = KVCachingManager(config)
         self.kv_cache_enabled = True
+
+    def set_cache_event_recorder(self, recorder: Optional[CacheEventRecorder]):
+        self.cache_event_recorder = recorder
+        self._update_fbcache_callback()
+
+    def _update_fbcache_callback(self):
+        if self.first_block_cache is None:
+            return
+        if self.cache_event_recorder is None:
+            self.first_block_cache.register_hit_callback(None)
+            return
+
+        def _callback(meta=None):
+            self._record_cache_event("first_block_cache", meta or {})
+
+        self.first_block_cache.register_hit_callback(_callback)
+
+    def _record_cache_event(self, cache_type: str, meta: Optional[dict] = None):
+        if self.cache_event_recorder is None:
+            return
+        try:
+            self.cache_event_recorder.record_event(cache_type, meta=meta or {})
+        except Exception:
+            pass
 
     def install_image_projection(self, in_channels):
         self.image_projection = ClipVisionProjection(in_channels=in_channels, out_channels=self.inner_dim)
@@ -1091,6 +1119,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
 
         if self.enable_teacache:
+            current_step_idx = getattr(self, "cnt", 0)
             modulated_inp = self.transformer_blocks[0].norm1(hidden_states, emb=temb)[0]
 
             if self.cnt == 0 or self.cnt == self.num_steps-1:
@@ -1111,6 +1140,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 self.cnt = 0
 
             if not should_calc:
+                self._record_cache_event("teacache", {"step": current_step_idx})
                 hidden_states = hidden_states + self.previous_residual
             else:
                 ori_hidden_states = hidden_states.clone()
@@ -1266,6 +1296,13 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 projected_encoder = projector_list[block_id](cached_encoder, sim_tensor)
             else:
                 projected_encoder = encoder_hidden_states
+            self._record_cache_event(
+                "similarity_cache",
+                {
+                    "block": f"{block_type}:{block_id}",
+                    "score": float(sim_score),
+                },
+            )
             return projected_hidden, projected_encoder
 
         hidden_states, encoder_hidden_states = self._execute_block(

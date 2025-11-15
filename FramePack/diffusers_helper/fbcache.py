@@ -28,6 +28,8 @@ class FirstBlockCache:
         self.hidden_states_residual: Optional[torch.Tensor] = None
         self.encoder_hidden_states_residual: Optional[torch.Tensor] = None
         self._last_diff = None
+        self._hit_callback = None
+        self.stats = {"hits": 0, "misses": 0}
 
     def reset(self):
         self.prev_first_residual = None
@@ -39,6 +41,9 @@ class FirstBlockCache:
         self.config = config
         if not self.config.enabled:
             self.reset()
+
+    def register_hit_callback(self, callback):
+        self._hit_callback = callback
 
     def maybe_run(
         self,
@@ -85,7 +90,7 @@ class FirstBlockCache:
         first_residual = (hidden_states - original_states).detach()
         reference_hidden_states = hidden_states.detach()
         reference_encoder_states = encoder_hidden_states.detach() if encoder_hidden_states is not None else None
-        can_use_cache = self._can_use_cache(first_residual)
+        can_use_cache, diff_ratio = self._can_use_cache(first_residual)
 
         if can_use_cache and self.hidden_states_residual is not None:
             hidden_states = hidden_states + self.hidden_states_residual
@@ -96,6 +101,12 @@ class FirstBlockCache:
             ):
                 encoder_hidden_states = encoder_hidden_states + self.encoder_hidden_states_residual
                 encoder_hidden_states = encoder_hidden_states.contiguous()
+            self.stats["hits"] += 1
+            if self._hit_callback is not None:
+                try:
+                    self._hit_callback({"ratio": diff_ratio})
+                except Exception:
+                    pass
             return hidden_states, encoder_hidden_states
 
         # cache miss -> run remaining blocks and store residuals
@@ -118,6 +129,7 @@ class FirstBlockCache:
             self.encoder_hidden_states_residual = (encoder_hidden_states - reference_encoder_states).detach()
         else:
             self.encoder_hidden_states_residual = None
+        self.stats["misses"] += 1
 
         return hidden_states, encoder_hidden_states
 
@@ -176,10 +188,10 @@ class FirstBlockCache:
             )
         return hidden_states, encoder_hidden_states
 
-    def _can_use_cache(self, new_residual: torch.Tensor) -> bool:
+    def _can_use_cache(self, new_residual: torch.Tensor) -> tuple[bool, float]:
         if self.prev_first_residual is None:
             self.prev_first_residual = new_residual
-            return False
+            return False, 0.0
 
         denom = torch.clamp(self.prev_first_residual.abs().mean(), min=1e-6)
         diff = (new_residual - self.prev_first_residual).abs().mean()
@@ -190,11 +202,11 @@ class FirstBlockCache:
         if ratio < self.config.threshold and self.hidden_states_residual is not None:
             if self.config.verbose:
                 print(f"[FBCache] hit diff={ratio:.4f} (threshold={self.config.threshold:.4f})")
-            return True
+            return True, ratio
 
         if self.config.verbose:
             print(f"[FBCache] miss diff={ratio:.4f} (threshold={self.config.threshold:.4f})")
-        return False
+        return False, ratio
 
     @staticmethod
     def _clone_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -209,6 +221,7 @@ class FirstBlockCache:
             "hidden_states_residual": self._clone_tensor(self.hidden_states_residual),
             "encoder_hidden_states_residual": self._clone_tensor(self.encoder_hidden_states_residual),
             "_last_diff": self._last_diff,
+            "stats": dict(self.stats),
         }
 
     def load_state_dict(self, state_dict):
@@ -221,3 +234,4 @@ class FirstBlockCache:
         self.hidden_states_residual = state_dict.get("hidden_states_residual")
         self.encoder_hidden_states_residual = state_dict.get("encoder_hidden_states_residual")
         self._last_diff = state_dict.get("_last_diff")
+        self.stats = dict(state_dict.get("stats", {"hits": 0, "misses": 0}))
