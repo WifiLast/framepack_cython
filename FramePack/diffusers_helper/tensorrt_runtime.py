@@ -600,3 +600,169 @@ class TensorRTTransformer:
             # Wrap in appropriate return type if needed
             return type('Output', (), {'sample': output})()
         return (output,) if isinstance(output, torch.Tensor) else output
+
+
+class LlamaTextEncoderWrapper(nn.Module):
+    """Wrapper for LLaMA text encoder that returns hidden states."""
+
+    def __init__(self, text_encoder: nn.Module):
+        super().__init__()
+        self.text_encoder = text_encoder
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Forward pass that extracts the third-to-last hidden state."""
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        # Return the third-to-last hidden state (as used in encode_prompt_conds)
+        return outputs.hidden_states[-3]
+
+
+class CLIPTextEncoderWrapper(nn.Module):
+    """Wrapper for CLIP text encoder that returns pooler output."""
+
+    def __init__(self, text_encoder: nn.Module):
+        super().__init__()
+        self.text_encoder = text_encoder
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass that extracts pooler output."""
+        outputs = self.text_encoder(input_ids, output_hidden_states=False)
+        return outputs.pooler_output
+
+
+class TensorRTTextEncoder:
+    """TensorRT wrapper for LLaMA text encoder with shape-based caching."""
+
+    def __init__(self, text_encoder: nn.Module, runtime: TensorRTRuntime, fallback_fn=None):
+        self.text_encoder = text_encoder
+        self.runtime = runtime
+        self.fallback_fn = fallback_fn
+        self.wrapper = LlamaTextEncoderWrapper(text_encoder)
+        self._cache: Dict[Tuple[int, int], nn.Module] = {}
+        self._lock = threading.Lock()
+
+    def _shape_key(self, input_ids: torch.Tensor) -> Tuple[int, int]:
+        """Generate cache key from input shape."""
+        return (int(input_ids.shape[0]), int(input_ids.shape[1]))
+
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        crop_start: int = 0,
+        attention_length: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Encode text with TensorRT acceleration."""
+        if not self.runtime.is_ready:
+            if self.fallback_fn is not None:
+                return self.fallback_fn(input_ids, attention_mask, crop_start, attention_length)
+            # Fallback to direct model call
+            outputs = self.text_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = outputs.hidden_states[-3]
+            if attention_length is not None:
+                return hidden_states[:, crop_start:attention_length]
+            return hidden_states[:, crop_start:]
+
+        key = self._shape_key(input_ids)
+        with self._lock:
+            engine = self._cache.get(key)
+            if engine is None:
+                input_id_spec = self.runtime.make_input_from_shape(tuple(input_ids.shape), name="input_ids")
+                attention_mask_spec = self.runtime.make_input_from_shape(tuple(attention_mask.shape), name="attention_mask")
+                try:
+                    engine = self.runtime.get_or_compile(
+                        f"llama_text_encoder_{key}",
+                        self.wrapper,
+                        input_specs=[input_id_spec, attention_mask_spec],
+                    )
+                except Exception:
+                    # Fallback on compilation failure
+                    if self.fallback_fn is not None:
+                        return self.fallback_fn(input_ids, attention_mask, crop_start, attention_length)
+                    outputs = self.text_encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    hidden_states = outputs.hidden_states[-3]
+                    if attention_length is not None:
+                        return hidden_states[:, crop_start:attention_length]
+                    return hidden_states[:, crop_start:]
+                self._cache[key] = engine
+
+        # Run TensorRT engine
+        input_ids_device = input_ids.to(device=self.runtime.device, non_blocking=True)
+        attention_mask_device = attention_mask.to(device=self.runtime.device, non_blocking=True)
+
+        with torch.no_grad():
+            hidden_states = engine(input_ids_device, attention_mask_device)
+
+        # Apply cropping if needed
+        if attention_length is not None:
+            hidden_states = hidden_states[:, crop_start:attention_length]
+        elif crop_start > 0:
+            hidden_states = hidden_states[:, crop_start:]
+
+        return hidden_states
+
+
+class TensorRTCLIPTextEncoder:
+    """TensorRT wrapper for CLIP text encoder with shape-based caching."""
+
+    def __init__(self, text_encoder: nn.Module, runtime: TensorRTRuntime, fallback_fn=None):
+        self.text_encoder = text_encoder
+        self.runtime = runtime
+        self.fallback_fn = fallback_fn
+        self.wrapper = CLIPTextEncoderWrapper(text_encoder)
+        self._cache: Dict[Tuple[int, int], nn.Module] = {}
+        self._lock = threading.Lock()
+
+    def _shape_key(self, input_ids: torch.Tensor) -> Tuple[int, int]:
+        """Generate cache key from input shape."""
+        return (int(input_ids.shape[0]), int(input_ids.shape[1]))
+
+    def encode(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Encode text with TensorRT acceleration."""
+        if not self.runtime.is_ready:
+            if self.fallback_fn is not None:
+                return self.fallback_fn(input_ids)
+            # Fallback to direct model call
+            outputs = self.text_encoder(input_ids, output_hidden_states=False)
+            return outputs.pooler_output
+
+        key = self._shape_key(input_ids)
+        with self._lock:
+            engine = self._cache.get(key)
+            if engine is None:
+                input_spec = self.runtime.make_input_from_shape(tuple(input_ids.shape), name="input_ids")
+                try:
+                    engine = self.runtime.get_or_compile(
+                        f"clip_text_encoder_{key}",
+                        self.wrapper,
+                        input_specs=[input_spec],
+                    )
+                except Exception:
+                    # Fallback on compilation failure
+                    if self.fallback_fn is not None:
+                        return self.fallback_fn(input_ids)
+                    outputs = self.text_encoder(input_ids, output_hidden_states=False)
+                    return outputs.pooler_output
+                self._cache[key] = engine
+
+        # Run TensorRT engine
+        input_ids_device = input_ids.to(device=self.runtime.device, non_blocking=True)
+
+        with torch.no_grad():
+            pooler_output = engine(input_ids_device)
+
+        return pooler_output

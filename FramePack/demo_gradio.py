@@ -205,6 +205,8 @@ from diffusers_helper.tensorrt_runtime import (
     TensorRTLatentEncoder,
     TensorRTCallable,
     TensorRTTransformer,
+    TensorRTTextEncoder,
+    TensorRTCLIPTextEncoder,
 )
 try:
     from third_party.fp8_optimization_utils import optimize_state_dict_with_fp8, apply_fp8_monkey_patch
@@ -983,8 +985,8 @@ FORCE_PARALLEL_LOADERS = os.environ.get("FRAMEPACK_FORCE_PARALLEL_LOADERS", "0")
 
 CACHE_MODE = args.cache_mode.lower()
 VAE_CHUNK_OVERRIDE = max(0, int(os.environ.get("FRAMEPACK_VAE_CHUNK_SIZE", "0")))
-VAE_CHUNK_RESERVE_GB = float(os.environ.get("FRAMEPACK_VAE_CHUNK_RESERVE_GB", "4.0"))
-VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.5"))
+VAE_CHUNK_RESERVE_GB = float(os.environ.get("FRAMEPACK_VAE_CHUNK_RESERVE_GB", "2.0"))
+VAE_CHUNK_SAFETY = float(os.environ.get("FRAMEPACK_VAE_CHUNK_SAFETY", "1.2"))
 VAE_UPSCALE_FACTOR = max(1, int(os.environ.get("FRAMEPACK_VAE_UPSCALE_FACTOR", "8")))
 TRT_WORKSPACE_MB = int(os.environ.get("FRAMEPACK_TRT_WORKSPACE_MB", "4096"))
 TRT_MAX_AUX_STREAMS = int(os.environ.get("FRAMEPACK_TRT_MAX_AUX_STREAMS", "2"))
@@ -1447,6 +1449,8 @@ else:
     print("TensorRT runtime disabled (use --enable-tensorrt to opt-in).")
 
 TENSORRT_TRANSFORMER = None
+TENSORRT_LLAMA_TEXT_ENCODER = None
+TENSORRT_CLIP_TEXT_ENCODER = None
 if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
     def _siglip_forward(pixel_values):
         return image_encoder(pixel_values=pixel_values)
@@ -1457,6 +1461,20 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
         forward_fn=_siglip_forward,
     )
     setattr(image_encoder, "_framepack_trt_callable", TENSORRT_SIGLIP_ENCODER)
+
+    # Initialize TensorRT text encoders (DISABLED - causing slowdown)
+    # TODO: Investigate why TensorRT text encoders are slower than PyTorch
+    # print("Initializing TensorRT text encoders...")
+    # TENSORRT_LLAMA_TEXT_ENCODER = TensorRTTextEncoder(
+    #     text_encoder,
+    #     TENSORRT_RUNTIME,
+    # )
+    # TENSORRT_CLIP_TEXT_ENCODER = TensorRTCLIPTextEncoder(
+    #     text_encoder_2,
+    #     TENSORRT_RUNTIME,
+    # )
+    # print("TensorRT text encoders initialized.")
+    print("TensorRT text encoders disabled (using PyTorch for text encoding)")
 
     # Initialize TensorRT transformer wrapper if enabled
     if TRT_TRANSFORMER_ENABLED:
@@ -1996,13 +2014,21 @@ def worker(
             print(f'Applied slow-motion hint to prompt: "{SLOW_MOTION_HINT}".')
 
         with inference_autocast():
-            llama_vec, clip_l_pooler = encode_prompt_conds(active_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec, clip_l_pooler = encode_prompt_conds(
+                active_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
+                trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
+                trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
+            )
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
             with inference_autocast():
-                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
+                    n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
+                    trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
+                    trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
+                )
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec, _ = align_tensor_dim_to_multiple(llama_vec, dim=1, multiple=TENSOR_CORE_MULTIPLE)
@@ -2129,7 +2155,7 @@ def worker(
                 move_model_to_device_with_memory_preservation(transformer_to_move, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
-                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.2)
+                transformer_backbone.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=0.1)
             else:
                 transformer_backbone.initialize_teacache(enable_teacache=False)
 
@@ -2387,7 +2413,7 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
             with gr.Accordion("Performance & Output", open=False):
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=24, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=2, maximum=128, value=8, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 16GB VRAM, use 2-5GB for best performance.")
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
                 tensorrt_decode_checkbox = gr.Checkbox(
                     label="TensorRT VAE Acceleration (beta)",

@@ -864,7 +864,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
         self.high_quality_fp32_output_for_inference = False
 
-    def enable_first_block_cache(self, *, enabled: bool = True, threshold: float = 0.03, verbose: bool = False):
+    def enable_first_block_cache(self, *, enabled: bool = True, threshold: float = 0.025, verbose: bool = False):
         if enabled:
             config = FirstBlockCacheConfig(enabled=True, threshold=max(1e-5, float(threshold)), verbose=verbose)
             if self.first_block_cache is None:

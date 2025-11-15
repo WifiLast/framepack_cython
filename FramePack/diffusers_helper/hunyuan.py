@@ -5,7 +5,8 @@ from diffusers_helper.utils import crop_or_pad_yield_mask
 
 
 @torch.no_grad()
-def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256):
+def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256,
+                        trt_llama_encoder=None, trt_clip_encoder=None):
     assert isinstance(prompt, str)
 
     prompt = [prompt]
@@ -30,24 +31,33 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
     llama_attention_mask = llama_inputs.attention_mask.to(text_encoder.device)
     llama_attention_length = int(llama_attention_mask.sum())
 
-    llama_outputs = text_encoder(
-        input_ids=llama_input_ids,
-        attention_mask=llama_attention_mask,
-        output_hidden_states=True,
-        return_dict=True,
-    )
+    # Use TensorRT encoder if available
+    if trt_llama_encoder is not None and trt_llama_encoder.runtime.is_ready:
+        llama_vec = trt_llama_encoder.encode(
+            llama_input_ids,
+            llama_attention_mask,
+            crop_start=crop_start,
+            attention_length=llama_attention_length,
+        )
+    else:
+        llama_outputs = text_encoder(
+            input_ids=llama_input_ids,
+            attention_mask=llama_attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-    # Debug: Check if hidden_states is None
-    if llama_outputs.hidden_states is None:
-        print(f"ERROR: llama_outputs.hidden_states is None!")
-        print(f"llama_outputs type: {type(llama_outputs)}")
-        print(f"llama_outputs attributes: {list(vars(llama_outputs).keys())}")
-        raise RuntimeError(f"text_encoder returned output without hidden_states. Output type: {type(llama_outputs)}")
+        # Debug: Check if hidden_states is None
+        if llama_outputs.hidden_states is None:
+            print(f"ERROR: llama_outputs.hidden_states is None!")
+            print(f"llama_outputs type: {type(llama_outputs)}")
+            print(f"llama_outputs attributes: {list(vars(llama_outputs).keys())}")
+            raise RuntimeError(f"text_encoder returned output without hidden_states. Output type: {type(llama_outputs)}")
 
-    llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
-    # llama_vec_remaining = llama_outputs.hidden_states[-3][:, llama_attention_length:]
+        llama_vec = llama_outputs.hidden_states[-3][:, crop_start:llama_attention_length]
+        # llama_vec_remaining = llama_outputs.hidden_states[-3][:, llama_attention_length:]
+
     llama_attention_mask = llama_attention_mask[:, crop_start:llama_attention_length]
-
     assert torch.all(llama_attention_mask.bool())
 
     # CLIP
@@ -61,7 +71,12 @@ def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokeniz
         return_length=False,
         return_tensors="pt",
     ).input_ids
-    clip_l_pooler = text_encoder_2(clip_l_input_ids.to(text_encoder_2.device), output_hidden_states=False).pooler_output
+
+    # Use TensorRT encoder if available
+    if trt_clip_encoder is not None and trt_clip_encoder.runtime.is_ready:
+        clip_l_pooler = trt_clip_encoder.encode(clip_l_input_ids.to(text_encoder_2.device))
+    else:
+        clip_l_pooler = text_encoder_2(clip_l_input_ids.to(text_encoder_2.device), output_hidden_states=False).pooler_output
 
     return llama_vec, clip_l_pooler
 
