@@ -99,6 +99,7 @@ def export_model_to_onnx(
             torch.cuda.empty_cache()
 
         # Export to ONNX
+        # Disable dynamo to avoid dynamic_axes/dynamic_shapes conflict
         with torch.inference_mode():
             torch.onnx.export(
                 model,
@@ -111,6 +112,7 @@ def export_model_to_onnx(
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
                 verbose=False,
+                dynamo=False,  # Disable dynamo to use legacy export with dynamic_axes
             )
 
         # Clear cache after export
