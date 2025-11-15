@@ -435,8 +435,9 @@ def convert_model_to_onnx(
         }
     elif model_type == 'flux_redux':
         dynamic_axes = {
-            'image_embeddings': {0: 'batch', 1: 'sequence'},
-            'output': {0: 'batch', 1: 'sequence'},
+            'pixel_values': {0: 'batch'},
+            'last_hidden_state': {0: 'batch'},
+            'pooler_output': {0: 'batch'},
         }
 
     # Determine output path
