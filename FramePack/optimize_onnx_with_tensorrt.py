@@ -167,7 +167,9 @@ def build_engine(
     print(f"\n{'='*80}")
     print(f"Successfully built TensorRT engine!")
     print(f"Engine saved to: {engine_path}")
-    print(f"Engine size: {len(serialized_engine) / (1024*1024):.2f} MB")
+    # Access the size via the nbytes attribute for IHostMemory objects
+    engine_size_mb = len(bytes(serialized_engine)) / (1024*1024) if hasattr(serialized_engine, '__len__') else serialized_engine.nbytes / (1024*1024)
+    print(f"Engine size: {engine_size_mb:.2f} MB")
     print(f"{'='*80}\n")
 
     return True

@@ -1503,12 +1503,13 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
         TENSORRT_SIGLIP_ENCODER = None
 
     # Check and convert models to ONNX if needed for TensorRT
-    if TRT_TEXT_ENCODERS_ENABLED or TRT_TRANSFORMER_ENABLED:
+    if TRT_TEXT_ENCODERS_ENABLED or TRT_TRANSFORMER_ENABLED or TENSORRT_AVAILABLE:
         try:
             from diffusers_helper.onnx_converter import (
                 prepare_text_encoder_for_tensorrt,
                 prepare_clip_text_encoder_for_tensorrt,
                 prepare_transformer_for_tensorrt,
+                prepare_image_encoder_for_tensorrt,
             )
 
             print("\n" + "="*80)
@@ -1548,6 +1549,18 @@ if TENSORRT_AVAILABLE and TENSORRT_RUNTIME is not None:
                     print("WARNING: Transformer ONNX conversion failed. TensorRT transformer will be disabled.")
                 else:
                     print(f"Transformer ready for TensorRT: {transformer_onnx_path}")
+
+            # Prepare image encoder (SigLip) for TensorRT if base TensorRT is enabled
+            if TENSORRT_AVAILABLE:
+                print("\nChecking SigLip image encoder...")
+                image_encoder_temp = image_encoder.to('cuda')
+                image_encoder_onnx_path = prepare_image_encoder_for_tensorrt(image_encoder_temp, device='cuda')
+                image_encoder_temp = image_encoder_temp.cpu()
+
+                if image_encoder_onnx_path is None:
+                    print("WARNING: Image encoder ONNX conversion failed. TensorRT image encoder may not work optimally.")
+                else:
+                    print(f"Image encoder ready for TensorRT: {image_encoder_onnx_path}")
 
             print("="*80)
             print("ONNX preparation complete. TensorRT will compile engines on first use.")

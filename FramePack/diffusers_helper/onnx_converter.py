@@ -232,6 +232,33 @@ def prepare_clip_text_encoder_for_tensorrt(clip_encoder: nn.Module, device: str 
     )
 
 
+def prepare_image_encoder_for_tensorrt(image_encoder: nn.Module, device: str = 'cuda') -> Optional[Path]:
+    """Prepare SigLip image encoder for TensorRT by ensuring ONNX model exists."""
+
+    def get_sample_inputs():
+        # SigLip expects pixel_values with shape [batch, 3, 384, 384]
+        batch_size = 1
+        pixel_values = torch.randn(batch_size, 3, 384, 384, dtype=torch.float16, device=device)
+        return (pixel_values,)
+
+    input_names = ['pixel_values']
+    output_names = ['last_hidden_state', 'pooler_output']
+    dynamic_axes = {
+        'pixel_values': {0: 'batch'},
+        'last_hidden_state': {0: 'batch'},
+        'pooler_output': {0: 'batch'},
+    }
+
+    return ensure_model_is_onnx_compatible(
+        model=image_encoder,
+        model_name='siglip_image_encoder',
+        sample_input_fn=get_sample_inputs,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+    )
+
+
 def prepare_transformer_for_tensorrt(
     transformer: nn.Module,
     device: str = 'cuda',
