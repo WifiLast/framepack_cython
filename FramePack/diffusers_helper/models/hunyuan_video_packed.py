@@ -885,9 +885,9 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self,
         *,
         enabled: bool = True,
-        threshold: float = 0.8,
-        max_skip: int = 4,
-        max_entries: int = 48,
+        threshold: float = 0.9,
+        max_skip: int = 1,
+        max_entries: int = 12,
         use_faiss: bool = False,
         verbose: bool = False,
     ):
@@ -988,7 +988,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.use_gradient_checkpointing = False
         print('self.use_gradient_checkpointing = False')
 
-    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.5):
+    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.1):
         self.enable_teacache = enable_teacache
         self.cnt = 0
         self.num_steps = num_steps
