@@ -2707,22 +2707,24 @@ def worker(
             active_prompt = _apply_prompt_hint(active_prompt, SLOW_MOTION_HINT)
             print(f'Applied slow-motion hint to prompt: "{SLOW_MOTION_HINT}".')
 
-        with inference_autocast():
-            llama_vec, clip_l_pooler = encode_prompt_conds(
-                active_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
-                trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
-                trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
-            )
+        with profile_section("text_encoding_positive", enabled=PROFILING_ENABLED):
+            with inference_autocast():
+                llama_vec, clip_l_pooler = encode_prompt_conds(
+                    active_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
+                    trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
+                    trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
+                )
 
         if cfg == 1:
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            with inference_autocast():
-                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
-                    n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
-                    trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
-                    trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
-                )
+            with profile_section("text_encoding_negative", enabled=PROFILING_ENABLED):
+                with inference_autocast():
+                    llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
+                        n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2,
+                        trt_llama_encoder=TENSORRT_LLAMA_TEXT_ENCODER,
+                        trt_clip_encoder=TENSORRT_CLIP_TEXT_ENCODER
+                    )
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec, _ = align_tensor_dim_to_multiple(llama_vec, dim=1, multiple=TENSOR_CORE_MULTIPLE)
@@ -2772,12 +2774,16 @@ def worker(
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
-        with inference_autocast():
-            if encoder_impl is not None:
-                start_latent = encoder_impl.encode(input_image_pt)
-            else:
-                start_latent = vae_encode(input_image_pt, vae)
-        start_latent = start_latent.to(dtype=MODEL_COMPUTE_DTYPE)
+        with profile_section("vae_encode", enabled=PROFILING_ENABLED):
+            with inference_autocast():
+                if encoder_impl is not None:
+                    start_latent = encoder_impl.encode(input_image_pt)
+                else:
+                    start_latent = vae_encode(input_image_pt, vae)
+            start_latent = start_latent.to(dtype=MODEL_COMPUTE_DTYPE)
+
+        if PROFILING_ENABLED and memory_tracker:
+            memory_tracker.snapshot("after_vae_encode")
 
         # CLIP Vision
 
@@ -2786,9 +2792,13 @@ def worker(
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        with inference_autocast():
-            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
+        with profile_section("image_encoder", enabled=PROFILING_ENABLED):
+            with inference_autocast():
+                image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+            image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(dtype=MODEL_COMPUTE_DTYPE)
+
+        if PROFILING_ENABLED and memory_tracker:
+            memory_tracker.snapshot("after_image_encode")
 
         # Dtype
 
@@ -2881,37 +2891,45 @@ def worker(
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
-            with inference_autocast():
-                generated_latents = sample_hunyuan(
-                    transformer=transformer_impl,
-                    sampler='unipc',
-                    width=width,
-                    height=height,
-                    frames=num_frames,
-                    real_guidance_scale=cfg,
-                    distilled_guidance_scale=gs,
-                    guidance_rescale=rs,
-                    # shift=3.0,
-                    num_inference_steps=steps,
-                    generator=rnd,
-                    prompt_embeds=llama_vec,
-                    prompt_embeds_mask=llama_attention_mask,
-                    prompt_poolers=clip_l_pooler,
-                    negative_prompt_embeds=llama_vec_n,
-                    negative_prompt_embeds_mask=llama_attention_mask_n,
-                    negative_prompt_poolers=clip_l_pooler_n,
-                    device=gpu,
-                    dtype=MODEL_COMPUTE_DTYPE,
-                    image_embeddings=image_encoder_last_hidden_state,
-                    latent_indices=latent_indices,
-                    clean_latents=clean_latents,
-                    clean_latent_indices=clean_latent_indices,
-                    clean_latents_2x=clean_latents_2x,
-                    clean_latent_2x_indices=clean_latent_2x_indices,
-                    clean_latents_4x=clean_latents_4x,
-                    clean_latent_4x_indices=clean_latent_4x_indices,
-                    callback=callback,
-                )
+            with profile_section(f"sampling_chunk_{chunk_index}", enabled=PROFILING_ENABLED):
+                if PROFILING_ENABLED and pytorch_profiler and chunk_index == 0:
+                    # Start PyTorch profiler for first chunk
+                    pytorch_profiler.start(f"sampling_trace_{job_id}")
+
+                with inference_autocast():
+                    generated_latents = sample_hunyuan(
+                        transformer=transformer_impl,
+                        sampler='unipc',
+                        width=width,
+                        height=height,
+                        frames=num_frames,
+                        real_guidance_scale=cfg,
+                        distilled_guidance_scale=gs,
+                        guidance_rescale=rs,
+                        # shift=3.0,
+                        num_inference_steps=steps,
+                        generator=rnd,
+                        prompt_embeds=llama_vec,
+                        prompt_embeds_mask=llama_attention_mask,
+                        prompt_poolers=clip_l_pooler,
+                        negative_prompt_embeds=llama_vec_n,
+                        negative_prompt_embeds_mask=llama_attention_mask_n,
+                        negative_prompt_poolers=clip_l_pooler_n,
+                        device=gpu,
+                        dtype=MODEL_COMPUTE_DTYPE,
+                        image_embeddings=image_encoder_last_hidden_state,
+                        latent_indices=latent_indices,
+                        clean_latents=clean_latents,
+                        clean_latent_indices=clean_latent_indices,
+                        clean_latents_2x=clean_latents_2x,
+                        clean_latent_2x_indices=clean_latent_2x_indices,
+                        clean_latents_4x=clean_latents_4x,
+                        clean_latent_4x_indices=clean_latent_4x_indices,
+                        callback=callback,
+                    )
+
+            if PROFILING_ENABLED and memory_tracker:
+                memory_tracker.snapshot(f"after_sampling_chunk_{chunk_index}")
 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
@@ -2948,22 +2966,24 @@ def worker(
                 torch.cuda.synchronize()
 
             if history_pixels is None:
-                history_pixels = vae_decode_chunked(
-                    real_history_latents,
-                    vae,
-                    chunk_size=None,
-                    quality_mode=quality_mode,
-                    decoder_fn=decoder_impl,
-                )
+                with profile_section(f"vae_decode_full_chunk_{chunk_index}", enabled=PROFILING_ENABLED):
+                    history_pixels = vae_decode_chunked(
+                        real_history_latents,
+                        vae,
+                        chunk_size=None,
+                        quality_mode=quality_mode,
+                        decoder_fn=decoder_impl,
+                    )
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 section_latent_frames = min(section_latent_frames, real_history_latents.shape[2])
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode_chunked(
-                    real_history_latents[:, :, :section_latent_frames],
-                    vae,
-                    chunk_size=None,
+                with profile_section(f"vae_decode_section_chunk_{chunk_index}", enabled=PROFILING_ENABLED):
+                    current_pixels = vae_decode_chunked(
+                        real_history_latents[:, :, :section_latent_frames],
+                        vae,
+                        chunk_size=None,
                     quality_mode=quality_mode,
                     decoder_fn=decoder_impl,
                 )
@@ -2997,6 +3017,46 @@ def worker(
 
     if hasattr(transformer_backbone, "set_cache_event_recorder"):
         transformer_backbone.set_cache_event_recorder(None)
+
+    # Export profiling results if enabled
+    if PROFILING_ENABLED:
+        print("\n" + "="*80)
+        print("PROFILING COMPLETE - Exporting Results")
+        print("="*80)
+
+        # Stop PyTorch profiler if it was started
+        if pytorch_profiler:
+            try:
+                pytorch_profiler.stop()
+            except Exception as e:
+                print(f"Warning: Failed to stop PyTorch profiler: {e}")
+
+        # Print timing summary
+        get_global_stats().print_summary(top_n=30)
+
+        # Print memory summary
+        if memory_tracker:
+            memory_tracker.print_summary()
+
+        # Export comprehensive report
+        try:
+            report_path = export_profiling_report(
+                output_dir=args.profiling_output_dir,
+                timing_stats=get_global_stats(),
+                memory_tracker=memory_tracker,
+                iteration_profiler=iteration_profiler,
+            )
+            print(f"\nProfiling data saved to: {args.profiling_output_dir}")
+            print(f"  - JSON report: {report_path}")
+            print(f"  - Chrome traces: {args.profiling_output_dir}/sampling_trace_*.json")
+            print("\nTo view Chrome traces:")
+            print("  1. Open Chrome browser")
+            print("  2. Go to: chrome://tracing")
+            print(f"  3. Load: {args.profiling_output_dir}/sampling_trace_*.json")
+        except Exception as e:
+            print(f"Warning: Failed to export profiling report: {e}")
+
+        print("="*80 + "\n")
 
     stream.output_queue.push(('timeline', cache_event_recorder.to_markdown()))
     stream.output_queue.push(('end', None))
