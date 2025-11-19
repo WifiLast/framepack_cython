@@ -1392,11 +1392,11 @@ TENSOR_CORE_MULTIPLE = tensor_core_multiple_for_dtype(MODEL_COMPUTE_DTYPE, INFER
 CPU_PREPROCESS_ACCEL = cpu_preprocessing_active()
 if CPU_PREPROCESS_ACCEL:
     print('CPU-side preprocessing acceleration enabled (SIMD/OpenCV + oneDAL).')
-ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "0") == "1") and not args.disable_fbcache
+ENABLE_FBCACHE = (os.environ.get("FRAMEPACK_ENABLE_FBCACHE", "1") == "1") and not args.disable_fbcache
 CURRENT_FBCACHE_ENABLED = ENABLE_FBCACHE
 FBCACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_FBCACHE_THRESHOLD", "0.035"))
 FBCACHE_VERBOSE = os.environ.get("FRAMEPACK_FBCACHE_VERBOSE", "0") == "1"
-ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "0") == "1") and not args.disable_sim_cache
+ENABLE_SIM_CACHE = (os.environ.get("FRAMEPACK_ENABLE_SIM_CACHE", "1") == "1") and not args.disable_sim_cache
 CURRENT_SIM_CACHE_ENABLED = ENABLE_SIM_CACHE
 SIM_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SIM_CACHE_THRESHOLD", "0.8"))
 SIM_CACHE_MAX_SKIP = int(os.environ.get("FRAMEPACK_SIM_CACHE_MAX_SKIP", "1"))
