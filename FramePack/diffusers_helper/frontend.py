@@ -89,6 +89,14 @@ def build_frontend(
                         step=1e-6,
                         info="Learning rate for whichever relationship trainer mode is active.",
                     )
+                    rt_batch_size = gr.Slider(
+                        label="Trainer Batch Size",
+                        minimum=32,
+                        maximum=1024,
+                        value=256,
+                        step=32,
+                        info="How many captured tuples to sample after each generation when training the active predictor.",
+                    )
 
                 with gr.Accordion("Sampler Controls", open=False):
                     latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
@@ -153,6 +161,7 @@ def build_frontend(
             tensorrt_transformer_checkbox,
             relationship_trainer_mode,
             rt_learning_rate,
+            rt_batch_size,
         ]
         start_button.click(
             fn=process_fn,

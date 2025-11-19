@@ -189,6 +189,7 @@ class DiTTimestepResidualTrainer(nn.Module):
 
         self.optimizer = torch.optim.AdamW(self.predictor.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
+        self._last_state_loaded = False
 
     def train_step(
         self,
@@ -214,6 +215,22 @@ class DiTTimestepResidualTrainer(nn.Module):
         loss.backward()
         self.optimizer.step()
         return loss.item()
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "predictor": self.predictor.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def load_state(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        predictor_state = state.get("predictor", state)
+        self.predictor.load_state_dict(predictor_state)
+        optimizer_state = state.get("optimizer")
+        if optimizer_state:
+            self.optimizer.load_state_dict(optimizer_state)
+        self._last_state_loaded = True
 
     @torch.no_grad()
     def approximate_forward(
@@ -439,6 +456,7 @@ class DiTTimestepModulationTrainer(nn.Module):
 
         self.optimizer = torch.optim.AdamW(self.predictor.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
+        self._last_state_loaded = False
 
     def train_step(self, temb: torch.Tensor) -> float:
         gamma, beta = self._extract_modulation(temb)
@@ -453,6 +471,22 @@ class DiTTimestepModulationTrainer(nn.Module):
     def predict(self, temb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         gamma_hat, beta_hat = self.predictor(temb.to(self.device))
         return gamma_hat, beta_hat
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "predictor": self.predictor.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }
+
+    def load_state(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        predictor_state = state.get("predictor", state)
+        self.predictor.load_state_dict(predictor_state)
+        optimizer_state = state.get("optimizer")
+        if optimizer_state:
+            self.optimizer.load_state_dict(optimizer_state)
+        self._last_state_loaded = True
 
     @torch.no_grad()
     def _extract_modulation(self, temb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

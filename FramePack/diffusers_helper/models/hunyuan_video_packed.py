@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import einops
@@ -519,6 +519,13 @@ class AdaLayerNormZero(nn.Module):
             self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
+        self._external_msa_modulation = None
+
+    def set_external_msa_modulation(self, gamma: Optional[torch.Tensor], beta: Optional[torch.Tensor]) -> None:
+        if gamma is None or beta is None:
+            self._external_msa_modulation = None
+        else:
+            self._external_msa_modulation = (gamma, beta)
 
     def forward(
         self,
@@ -528,6 +535,10 @@ class AdaLayerNormZero(nn.Module):
         emb = emb.unsqueeze(-2)
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=-1)
+        ext = self._external_msa_modulation
+        self._external_msa_modulation = None
+        if ext is not None:
+            scale_msa, shift_msa = ext
         x = self.norm(x) * (1 + scale_msa) + shift_msa
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
@@ -542,6 +553,13 @@ class AdaLayerNormZeroSingle(nn.Module):
             self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
+        self._external_msa_modulation = None
+
+    def set_external_msa_modulation(self, gamma: Optional[torch.Tensor], beta: Optional[torch.Tensor]) -> None:
+        if gamma is None or beta is None:
+            self._external_msa_modulation = None
+        else:
+            self._external_msa_modulation = (gamma, beta)
 
     def forward(
         self,
@@ -551,6 +569,10 @@ class AdaLayerNormZeroSingle(nn.Module):
         emb = emb.unsqueeze(-2)
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=-1)
+        ext = self._external_msa_modulation
+        self._external_msa_modulation = None
+        if ext is not None:
+            scale_msa, shift_msa = ext
         x = self.norm(x) * (1 + scale_msa) + shift_msa
         return x, gate_msa
 
@@ -858,6 +880,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.kv_cache_manager: Optional[KVCachingManager] = None
         self.cache_event_recorder: Optional[CacheEventRecorder] = None
         self.block_io_callback = None
+        self.block_overrides: Dict[Tuple[str, int], Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]] = {}
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -951,6 +974,21 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
     def set_cache_event_recorder(self, recorder: Optional[CacheEventRecorder]):
         self.cache_event_recorder = recorder
         self._update_fbcache_callback()
+
+    def set_block_override(
+        self,
+        block_type: str,
+        block_id: int,
+        fn: Optional[Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]],
+    ) -> None:
+        key = (block_type, block_id)
+        if fn is None:
+            self.block_overrides.pop(key, None)
+        else:
+            self.block_overrides[key] = fn
+
+    def clear_block_overrides(self) -> None:
+        self.block_overrides.clear()
 
     def _update_fbcache_callback(self):
         if self.first_block_cache is None:
@@ -1350,28 +1388,58 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         block_type: str,
     ):
         input_hidden = None
+        encoder_input = None
         if self.block_io_callback is not None:
-            # The callback gets detached tensors to avoid holding onto the graph.
             input_hidden = hidden_states.detach()
+            if encoder_hidden_states is not None:
+                encoder_input = encoder_hidden_states.detach()
 
-        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-            block,
-            hidden_states,
-            encoder_hidden_states,
-            temb,
-            attention_mask,
-            rope_freqs,
-        )
+        override = self.block_overrides.get((block_type, block_id))
+        if override is not None:
+            override_kwargs = {
+                "attention_mask": attention_mask,
+            }
+            if block_type == "dual":
+                override_kwargs["freqs_cis"] = rope_freqs
+            else:
+                override_kwargs["image_rotary_emb"] = rope_freqs
+            hidden_states, encoder_hidden_states = override(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                **override_kwargs,
+            )
+        else:
+            hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask,
+                rope_freqs,
+            )
 
         if self.block_io_callback is not None and input_hidden is not None:
             output_hidden = hidden_states.detach()
             try:
-                # The callback should handle moving data to CPU/offloading if needed.
-                self.block_io_callback(block_id, block_type, input_hidden, output_hidden)
+                rope_data = None
+                if isinstance(rope_freqs, (list, tuple)):
+                    rope_data = [tensor.detach() for tensor in rope_freqs]
+                elif isinstance(rope_freqs, torch.Tensor):
+                    rope_data = rope_freqs.detach()
+                attn_mask_detached = attention_mask.detach() if isinstance(attention_mask, torch.Tensor) else attention_mask
+                self.block_io_callback(
+                    block_id,
+                    block_type,
+                    input_hidden,
+                    output_hidden,
+                    encoder_input=encoder_input,
+                    temb=temb.detach(),
+                    attention_mask=attn_mask_detached,
+                    rope_freqs=rope_data,
+                )
             except Exception as e:
-                # Prevent a faulty callback from crashing the main generation process.
                 print(f"Warning: block_io_callback failed for block {block_type}:{block_id}: {e}")
-                # Disable the callback for the rest of the run to avoid repeated errors.
                 self.block_io_callback = None
 
         return hidden_states, encoder_hidden_states

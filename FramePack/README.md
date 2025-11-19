@@ -112,6 +112,23 @@ You will see the progress bar for each section and the latent preview for the ne
 
 Note that the initial progress may be slower than later diffusion as the device may need some warmup.
 
+## Experimental Relationship Trainers
+
+The **Experimental** accordion in the UI now exposes three lightweight online trainers via the `Relationship Trainer Mode` radio:
+
+- `hidden_state` (original): collects `(h_in, h_out)` per transformer block and fits a small MLP on the residual `h_out − h_in`.
+- `residual`: captures `(h_in, encoder, temb, mask, RoPE)` tuples so a per-block `DiTTimestepResidualTrainer` can learn the timestep residual and toggle inference to `h_base + gφ(h_in, T_t)`.
+- `modulation`: records timestep embeddings to distill the AdaLN γ(t)/β(t) outputs with `DiTTimestepModulationTrainer` and replay them directly during inference.
+
+Use the `Trainer Learning Rate` and `Trainer Batch Size` sliders to control how aggressive each post-generation update should be. After every video the app samples the requested number of cached tuples, runs one optimizer step for the selected mode, and logs the average loss. Trained predictors persist automatically under `Cache/runtime_caches` (hidden state, residual, and modulation have their own `.pt` files) and the overrides are cleared whenever you switch the radio back to `off`.
+
+Tips:
+
+- Start with small learning rates (1e-4) and moderate batch sizes (128–256) to avoid destabilising the DiT surrogate.
+- Residual/modulation predictors need previously collected tuples to be useful; let them warm up for a few generations before enabling them for production runs.
+- Disabling the mode removes all block overrides so inference falls back to vanilla FramePack without a restart.
+- Set `FRAMEPACK_RELATIONSHIP_SAMPLE_LIMIT` (default `2048`) if you need to control how many tuples are buffered per generation.
+
 # Sanity Check
 
 Before trying your own inputs, we highly recommend going through the sanity check to find out if any hardware or software went wrong. 

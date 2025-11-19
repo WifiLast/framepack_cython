@@ -174,7 +174,11 @@ from diffusers_helper.cpu_opt import (
 )
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
-from diffusers_helper.relationship_trainer import HiddenStateRelationshipTrainer
+from diffusers_helper.relationship_trainer import (
+    HiddenStateRelationshipTrainer,
+    DiTTimestepResidualTrainer,
+    DiTTimestepModulationTrainer,
+)
 from diffusers_helper.frontend import build_frontend
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper import memory as memory_v1
@@ -2193,6 +2197,7 @@ else:
 
 # Relationship Trainer (Experimental)
 RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = False
+ACTIVE_RELATIONSHIP_MODE = "off"
 relationship_trainer = None
 try:
     # inner_dim of the transformer is num_attention_heads * attention_head_dim = 24 * 128 = 3072
@@ -2204,6 +2209,357 @@ try:
 except Exception as e:
     print(f"Warning: Could not initialize HiddenStateRelationshipTrainer: {e}")
     relationship_trainer = None
+
+RELATIONSHIP_SAMPLE_LIMIT = int(os.environ.get("FRAMEPACK_RELATIONSHIP_SAMPLE_LIMIT", "2048"))
+RELATIONSHIP_RESIDUAL_CACHE_NAME = "relationship_residual_predictors"
+RELATIONSHIP_MODULATION_CACHE_NAME = "relationship_modulation_predictors"
+
+
+def _load_relationship_cache(name: str) -> Dict[str, Any]:
+    state = _load_runtime_cache_state(name)
+    if isinstance(state, dict):
+        return state
+    if state is not None:
+        print(f'Warning: Expected dict for "{name}" but received {type(state).__name__}; ignoring.')
+    return {}
+
+
+RESIDUAL_TRAINER_STATES: Dict[str, Any] = _load_relationship_cache(RELATIONSHIP_RESIDUAL_CACHE_NAME)
+MODULATION_TRAINER_STATES: Dict[str, Any] = _load_relationship_cache(RELATIONSHIP_MODULATION_CACHE_NAME)
+if RESIDUAL_TRAINER_STATES:
+    print(f"Loaded {len(RESIDUAL_TRAINER_STATES)} per-block timestep residual predictors.")
+if MODULATION_TRAINER_STATES:
+    print(f"Loaded {len(MODULATION_TRAINER_STATES)} per-block modulation predictors.")
+
+RESIDUAL_TRAINERS: Dict[Tuple[str, int], DiTTimestepResidualTrainer] = {}
+MODULATION_TRAINERS: Dict[Tuple[str, int], DiTTimestepModulationTrainer] = {}
+RESIDUAL_READY_KEYS: set[str] = set(RESIDUAL_TRAINER_STATES.keys())
+MODULATION_READY_KEYS: set[str] = set(MODULATION_TRAINER_STATES.keys())
+
+
+def _relationship_block_key(block_type: str, block_id: int) -> str:
+    return f"{block_type}:{block_id}"
+
+
+def _clone_sample_to_cpu(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.detach().to("cpu")
+    if isinstance(value, tuple):
+        return tuple(_clone_sample_to_cpu(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_sample_to_cpu(v) for v in value]
+    return value
+
+
+def _move_sample_to_device(value, device):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_sample_to_device(v, device) for v in value)
+    if isinstance(value, list):
+        return [_move_sample_to_device(v, device) for v in value]
+    return value
+
+
+def _get_backbone_block(backbone, block_type: str, block_id: int):
+    if block_type == "dual":
+        blocks = getattr(backbone, "transformer_blocks", None)
+    elif block_type == "single":
+        blocks = getattr(backbone, "single_transformer_blocks", None)
+    else:
+        raise ValueError(f"Unknown block_type '{block_type}'")
+    if blocks is None or block_id >= len(blocks):
+        raise IndexError(f"block_id {block_id} invalid for type '{block_type}'")
+    return blocks[block_id]
+
+
+def _call_block_default(block, block_type: str, hidden_states, encoder_hidden_states, temb, attention_mask, freqs_cis, image_rotary_emb):
+    if block_type == "dual":
+        return block(hidden_states, encoder_hidden_states, temb, attention_mask, freqs_cis)
+    return block(hidden_states, encoder_hidden_states, temb, attention_mask, image_rotary_emb)
+
+
+def _ensure_residual_trainer(backbone, block_type: str, block_id: int, temb_dim: int, lr: float, device) -> DiTTimestepResidualTrainer:
+    key = (block_type, block_id)
+    trainer = RESIDUAL_TRAINERS.get(key)
+    if trainer is None:
+        block = _get_backbone_block(backbone, block_type, block_id)
+        if block_type == "dual":
+            hidden_dim = block.norm1.linear.in_features
+        else:
+            hidden_dim = block.norm.linear.in_features
+        trainer = DiTTimestepResidualTrainer(
+            block=block,
+            hidden_dim=hidden_dim,
+            temb_dim=temb_dim,
+            lr=lr,
+            device=device,
+        )
+        state = RESIDUAL_TRAINER_STATES.get(_relationship_block_key(block_type, block_id))
+        if state:
+            trainer.load_state(state)
+        RESIDUAL_TRAINERS[key] = trainer
+    else:
+        for group in trainer.optimizer.param_groups:
+            group["lr"] = lr
+    return trainer
+
+
+def _ensure_modulation_trainer(backbone, block_type: str, block_id: int, temb_dim: int, lr: float, device) -> DiTTimestepModulationTrainer:
+    key = (block_type, block_id)
+    trainer = MODULATION_TRAINERS.get(key)
+    if trainer is None:
+        block = _get_backbone_block(backbone, block_type, block_id)
+        if block_type == "dual":
+            mod_dim = block.norm1.linear.in_features
+        else:
+            mod_dim = block.norm.linear.in_features
+        trainer = DiTTimestepModulationTrainer(
+            block=block,
+            temb_dim=temb_dim,
+            mod_dim=mod_dim,
+            lr=lr,
+            device=device,
+        )
+        state = MODULATION_TRAINER_STATES.get(_relationship_block_key(block_type, block_id))
+        if state:
+            trainer.load_state(state)
+        MODULATION_TRAINERS[key] = trainer
+    else:
+        for group in trainer.optimizer.param_groups:
+            group["lr"] = lr
+    return trainer
+
+
+def _install_residual_block_overrides(backbone, device, lr):
+    for block_type, blocks in (("dual", getattr(backbone, "transformer_blocks", [])), ("single", getattr(backbone, "single_transformer_blocks", []))):
+        for block_id, block in enumerate(blocks):
+            def _override(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask=None,
+                freqs_cis=None,
+                image_rotary_emb=None,
+                _block=block,
+                _block_type=block_type,
+                _block_id=block_id,
+            ):
+                key = _relationship_block_key(_block_type, _block_id)
+                trainer = _ensure_residual_trainer(backbone, _block_type, _block_id, temb.shape[-1], lr, device)
+                if key not in RESIDUAL_READY_KEYS:
+                    return _call_block_default(
+                        _block,
+                        _block_type,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        attention_mask,
+                        freqs_cis,
+                        image_rotary_emb,
+                    )
+                approx_hidden, approx_encoder = trainer.approximate_forward(
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    attention_mask=attention_mask,
+                    freqs_cis=freqs_cis if _block_type == "dual" else None,
+                    image_rotary_emb=image_rotary_emb if _block_type == "single" else None,
+                )
+                return approx_hidden, approx_encoder
+
+            backbone.set_block_override(block_type, block_id, _override)
+
+
+def _install_modulation_block_overrides(backbone, device, lr):
+    for block_type, blocks in (("dual", getattr(backbone, "transformer_blocks", [])), ("single", getattr(backbone, "single_transformer_blocks", []))):
+        for block_id, block in enumerate(blocks):
+            def _override(
+                hidden_states,
+                encoder_hidden_states,
+                temb,
+                attention_mask=None,
+                freqs_cis=None,
+                image_rotary_emb=None,
+                _block=block,
+                _block_type=block_type,
+                _block_id=block_id,
+            ):
+                key = _relationship_block_key(_block_type, _block_id)
+                trainer = _ensure_modulation_trainer(backbone, _block_type, _block_id, temb.shape[-1], lr, device)
+                if key not in MODULATION_READY_KEYS:
+                    return _call_block_default(
+                        _block,
+                        _block_type,
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        attention_mask,
+                        freqs_cis,
+                        image_rotary_emb,
+                    )
+                temb_for_trainer = temb.detach()
+                if temb_for_trainer.device != trainer.device:
+                    temb_for_trainer = temb_for_trainer.to(trainer.device)
+                gamma_hat, beta_hat = trainer.predict(temb_for_trainer)
+                if _block_type == "dual":
+                    _block.norm1.set_external_msa_modulation(gamma_hat, beta_hat)
+                    _block.norm1_context.set_external_msa_modulation(gamma_hat, beta_hat)
+                    return _block(hidden_states, encoder_hidden_states, temb, attention_mask, freqs_cis)
+                _block.norm.set_external_msa_modulation(gamma_hat, beta_hat)
+                return _block(hidden_states, encoder_hidden_states, temb, attention_mask, image_rotary_emb)
+
+            backbone.set_block_override(block_type, block_id, _override)
+
+
+def _configure_relationship_block_overrides(backbone, mode: str, device, lr: float):
+    if backbone is None or not hasattr(backbone, "set_block_override"):
+        return
+    if hasattr(backbone, "clear_block_overrides"):
+        backbone.clear_block_overrides()
+    if mode == "residual":
+        _install_residual_block_overrides(backbone, device, lr)
+    elif mode == "modulation":
+        _install_modulation_block_overrides(backbone, device, lr)
+
+
+def _export_relationship_trainer_states(
+    trainers: Dict[Tuple[str, int], Any],
+    existing: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(existing)
+    for (block_type, block_id), trainer in trainers.items():
+        try:
+            payload[_relationship_block_key(block_type, block_id)] = trainer.export_state()
+        except Exception as exc:
+            print(f"Warning: Failed to export predictor for {block_type}:{block_id}: {exc}")
+    return payload
+
+
+def _train_hidden_state_samples(samples: List[Dict[str, Any]], trainer: HiddenStateRelationshipTrainer, batch_size: int) -> Tuple[float, int]:
+    if trainer is None or not samples:
+        return 0.0, 0
+    import random
+
+    target_batch = max(1, min(len(samples), int(batch_size)))
+    chosen = random.sample(samples, k=target_batch)
+    total_loss = 0.0
+
+    with torch.enable_grad():
+        for sample in chosen:
+            input_h = _move_sample_to_device(sample["h_in"], trainer.device)
+            output_h = _move_sample_to_device(sample["h_out"], trainer.device)
+            residual = output_h - input_h
+            total_loss += trainer.train_step(input_h, residual)
+
+    return total_loss, len(chosen)
+
+
+def _train_residual_predictors(
+    samples: List[Dict[str, Any]],
+    backbone,
+    lr: float,
+    batch_size: int,
+    device,
+) -> Tuple[float, int]:
+    if not samples:
+        return 0.0, 0
+    import random
+
+    target_batch = max(1, min(len(samples), int(batch_size)))
+    chosen = random.sample(samples, k=target_batch)
+    total_loss = 0.0
+    processed = 0
+    updated_blocks: set[Tuple[str, int]] = set()
+
+    with torch.enable_grad():
+        for sample in chosen:
+            temb = sample.get("temb")
+            if temb is None:
+                continue
+            block_type = sample["block_type"]
+            block_id = sample["block_id"]
+            trainer = _ensure_residual_trainer(backbone, block_type, block_id, temb.shape[-1], lr, device)
+            hidden_states = _move_sample_to_device(sample["h_in"], trainer.device)
+            encoder_states = _move_sample_to_device(sample.get("encoder"), trainer.device)
+            temb_dev = _move_sample_to_device(temb, trainer.device)
+            attention_mask = _move_sample_to_device(sample.get("attention_mask"), trainer.device)
+            rope_freqs = _move_sample_to_device(sample.get("rope_freqs"), trainer.device)
+            try:
+                loss = trainer.train_step(
+                    hidden_states,
+                    encoder_states,
+                    temb_dev,
+                    attention_mask=attention_mask,
+                    freqs_cis=rope_freqs if block_type == "dual" else None,
+                    image_rotary_emb=rope_freqs if block_type == "single" else None,
+                )
+            except Exception as exc:
+                print(f"Warning: Residual predictor update failed for {block_type}:{block_id}: {exc}")
+                continue
+            total_loss += loss
+            processed += 1
+            RESIDUAL_READY_KEYS.add(_relationship_block_key(block_type, block_id))
+            updated_blocks.add((block_type, block_id))
+
+    for block_type, block_id in updated_blocks:
+        key = _relationship_block_key(block_type, block_id)
+        try:
+            RESIDUAL_TRAINER_STATES[key] = RESIDUAL_TRAINERS[(block_type, block_id)].export_state()
+        except Exception as exc:
+            print(f"Warning: Failed to snapshot residual predictor for {block_type}:{block_id}: {exc}")
+
+    return total_loss, processed
+
+
+def _train_modulation_predictors(
+    samples: List[Dict[str, Any]],
+    backbone,
+    lr: float,
+    batch_size: int,
+    device,
+) -> Tuple[float, int]:
+    if not samples:
+        return 0.0, 0
+    import random
+
+    target_batch = max(1, min(len(samples), int(batch_size)))
+    chosen = random.sample(samples, k=target_batch)
+    total_loss = 0.0
+    processed = 0
+    updated_blocks: set[Tuple[str, int]] = set()
+
+    with torch.enable_grad():
+        for sample in chosen:
+            temb = sample.get("temb")
+            if temb is None:
+                continue
+            block_type = sample["block_type"]
+            block_id = sample["block_id"]
+            trainer = _ensure_modulation_trainer(backbone, block_type, block_id, temb.shape[-1], lr, device)
+            temb_dev = _move_sample_to_device(temb, trainer.device)
+            try:
+                loss = trainer.train_step(temb_dev)
+            except Exception as exc:
+                print(f"Warning: Modulation predictor update failed for {block_type}:{block_id}: {exc}")
+                continue
+            total_loss += loss
+            processed += 1
+            MODULATION_READY_KEYS.add(_relationship_block_key(block_type, block_id))
+            updated_blocks.add((block_type, block_id))
+
+    for block_type, block_id in updated_blocks:
+        key = _relationship_block_key(block_type, block_id)
+        try:
+            MODULATION_TRAINER_STATES[key] = MODULATION_TRAINERS[(block_type, block_id)].export_state()
+        except Exception as exc:
+            print(f"Warning: Failed to snapshot modulation predictor for {block_type}:{block_id}: {exc}")
+
+    return total_loss, processed
 
 
 def _persist_runtime_caches_on_exit():
@@ -2229,6 +2585,16 @@ def _persist_runtime_caches_on_exit():
     if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and relationship_trainer is not None:
         print("Persisting relationship trainer state to disk...")
         _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+
+    if RESIDUAL_TRAINER_STATES or RESIDUAL_TRAINERS:
+        merged_residual = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
+        if merged_residual:
+            _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, merged_residual)
+
+    if MODULATION_TRAINER_STATES or MODULATION_TRAINERS:
+        merged_modulation = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
+        if merged_modulation:
+            _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, merged_modulation)
 
 
 atexit.register(_persist_runtime_caches_on_exit)
@@ -2589,6 +2955,7 @@ def worker(
     use_tensorrt_transformer=False,
     relationship_trainer_mode="off",
     rt_learning_rate=1e-4,
+    rt_batch_size=256,
 ):
     # Initialize profiling if enabled
     PROFILING_ENABLED = args.enable_profiling
@@ -2661,33 +3028,59 @@ def worker(
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer_impl)
 
     # Setup for experimental relationship trainer
-    global RELATIONSHIP_TRAINER_ENABLED_FOR_RUN
-    RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = (
-        relationship_trainer_mode == "hidden_state" and relationship_trainer is not None
-    )
-    block_io_data = []
+    normalized_trainer_mode = (relationship_trainer_mode or "off").lower()
+    _configure_relationship_block_overrides(transformer_backbone, normalized_trainer_mode, gpu, rt_learning_rate)
+    global RELATIONSHIP_TRAINER_ENABLED_FOR_RUN, ACTIVE_RELATIONSHIP_MODE
+    ACTIVE_RELATIONSHIP_MODE = normalized_trainer_mode
+    RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = normalized_trainer_mode != "off"
+    trainer_batch_size = max(1, int(rt_batch_size))
+    block_io_data: List[Dict[str, Any]] = []
+
+    if normalized_trainer_mode == "hidden_state":
+        if relationship_trainer is None:
+            RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = False
+            print("Hidden-state relationship trainer unavailable; disabling mode.")
+        else:
+            print(f"Enabling Hidden State Trainer (lr={rt_learning_rate:.2e}, batch={trainer_batch_size}).")
+            relationship_trainer.to(gpu)
+            relationship_trainer.optimizer = torch.optim.Adam(
+                relationship_trainer.model.parameters(),
+                lr=rt_learning_rate,
+            )
+    elif normalized_trainer_mode in {"residual", "modulation"}:
+        print(
+            f"Relationship trainer mode '{normalized_trainer_mode}' enabled "
+            f"(lr={rt_learning_rate:.2e}, batch={trainer_batch_size}). Capturing block tuples."
+        )
+    elif normalized_trainer_mode != "off":
+        RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = False
+        print(f"Unknown relationship trainer mode '{normalized_trainer_mode}'. Disabling capture.")
 
     if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN:
-        print(f"Enabling Hidden State Trainer with LR={rt_learning_rate}.")
-        relationship_trainer.to(gpu)
-        # Re-initialize optimizer with the potentially new learning rate from the UI
-        relationship_trainer.optimizer = torch.optim.Adam(relationship_trainer.model.parameters(), lr=rt_learning_rate)
-        
-        def block_io_callback(block_id, block_type, input_h, output_h):
-            # The trainer learns to predict the residual (output - input)
-            residual = output_h - input_h
-            # Store on CPU to save VRAM
-            block_io_data.append((input_h.cpu(), residual.cpu()))
+        def block_io_callback(
+            block_id,
+            block_type,
+            input_h,
+            output_h,
+            **kwargs,
+        ):
+            sample = {
+                "block_type": block_type,
+                "block_id": block_id,
+                "h_in": _clone_sample_to_cpu(input_h),
+                "h_out": _clone_sample_to_cpu(output_h),
+                "encoder": _clone_sample_to_cpu(kwargs.get("encoder_input")),
+                "temb": _clone_sample_to_cpu(kwargs.get("temb")),
+                "attention_mask": _clone_sample_to_cpu(kwargs.get("attention_mask")),
+                "rope_freqs": _clone_sample_to_cpu(kwargs.get("rope_freqs")),
+            }
+            block_io_data.append(sample)
+            if len(block_io_data) > RELATIONSHIP_SAMPLE_LIMIT:
+                block_io_data.pop(0)
 
         transformer_backbone.block_io_callback = block_io_callback
-    elif relationship_trainer_mode and relationship_trainer_mode != "off":
-        print(
-            f"Relationship trainer mode '{relationship_trainer_mode}' selected "
-            "but only the hidden-state trainer is currently integrated."
-        )
-    else:
-        if hasattr(transformer_backbone, 'block_io_callback'):
-            transformer_backbone.block_io_callback = None
+    elif hasattr(transformer_backbone, "block_io_callback"):
+        transformer_backbone.block_io_callback = None
 
     cache_event_recorder = CacheEventRecorder()
     cache_event_recorder.reset()
@@ -3072,27 +3465,48 @@ def worker(
 
         # After generation, run the training step if enabled
         if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
-            print(f"\\nTraining relationship trainer on {len(block_io_data)} captured block I/O pairs...")
-            # Use a random subset of the collected data to keep training time reasonable
-            import random
-            sample_size = min(len(block_io_data), 256)
-            training_samples = random.sample(block_io_data, k=sample_size)
-            
-            total_loss = 0
-            # Re-enable gradients for this training step
-            with torch.enable_grad():
-                for i, (input_h, residual) in enumerate(training_samples):
-                    loss = relationship_trainer.train_step(input_h, residual)
-                    total_loss += loss
-                    if (i + 1) % 64 == 0:
-                        print(f"  ... trained on {i+1}/{sample_size} samples")
-
-            avg_loss = total_loss / sample_size if sample_size > 0 else 0
-            print(f"Relationship trainer step finished. Average loss: {avg_loss:.6f}")
-            
-            # Persist the newly trained model immediately
-            print("Persisting relationship trainer state to disk...")
-            _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+            print(f"\nTraining {normalized_trainer_mode} relationship trainer on {len(block_io_data)} tuples...")
+            if normalized_trainer_mode == "hidden_state" and relationship_trainer is not None:
+                total_loss, processed = _train_hidden_state_samples(block_io_data, relationship_trainer, trainer_batch_size)
+                if processed > 0:
+                    avg_loss = total_loss / processed
+                    print(f"Hidden-state trainer updated on {processed} samples; avg loss={avg_loss:.6f}")
+                    print("Persisting relationship trainer state to disk...")
+                    _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+                else:
+                    print("Hidden-state trainer skipped (no valid samples).")
+            elif normalized_trainer_mode == "residual":
+                total_loss, processed = _train_residual_predictors(
+                    block_io_data,
+                    transformer_backbone,
+                    rt_learning_rate,
+                    trainer_batch_size,
+                    gpu,
+                )
+                if processed > 0:
+                    avg_loss = total_loss / processed
+                    print(f"Residual predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                    residual_payload = _export_relationship_trainer_states(RESIDUAL_TRAINERS, RESIDUAL_TRAINER_STATES)
+                    _save_runtime_cache_state(RELATIONSHIP_RESIDUAL_CACHE_NAME, residual_payload)
+                else:
+                    print("Residual predictor training skipped (no valid samples).")
+            elif normalized_trainer_mode == "modulation":
+                total_loss, processed = _train_modulation_predictors(
+                    block_io_data,
+                    transformer_backbone,
+                    rt_learning_rate,
+                    trainer_batch_size,
+                    gpu,
+                )
+                if processed > 0:
+                    avg_loss = total_loss / processed
+                    print(f"Modulation predictors updated on {processed} samples; avg loss={avg_loss:.6f}")
+                    modulation_payload = _export_relationship_trainer_states(MODULATION_TRAINERS, MODULATION_TRAINER_STATES)
+                    _save_runtime_cache_state(RELATIONSHIP_MODULATION_CACHE_NAME, modulation_payload)
+                else:
+                    print("Modulation predictor training skipped (no valid samples).")
+            else:
+                print(f"No trainer registered for mode '{normalized_trainer_mode}'.")
 
             block_io_data.clear()
 
@@ -3112,6 +3526,8 @@ def worker(
     # Clean up relationship trainer callback
     if hasattr(transformer_backbone, 'block_io_callback'):
         transformer_backbone.block_io_callback = None
+    if hasattr(transformer_backbone, "clear_block_overrides"):
+        transformer_backbone.clear_block_overrides()
 
     # Export profiling results if enabled
     if PROFILING_ENABLED:
@@ -3190,6 +3606,7 @@ def process(
     use_tensorrt_transformer,
     relationship_trainer_mode,
     rt_learning_rate,
+    rt_batch_size,
 ):
     global stream
     assert input_image is not None, 'No input image!'
@@ -3224,6 +3641,7 @@ def process(
         use_tensorrt_transformer,
         relationship_trainer_mode,
         rt_learning_rate,
+        rt_batch_size,
     )
 
     output_filename = None

@@ -586,6 +586,8 @@ print(TENSORRT_DECODER._cache.keys())
 
 Use the lightweight predictor in `diffusers_helper/relationship_trainer.py` when you want to keep the DiT weights frozen but still capture the timestep-modulation path:
 
+> **UI shortcut:** choose `Relationship Trainer Mode = residual` inside the demo, adjust the Trainer LR/Batch Size sliders, and let the UI collect `(h_in, encoder, temb, mask, RoPE)` tuples automatically. The per-block `DiTTimestepResidualTrainer` state is persisted to `Cache/runtime_caches/relationship_residual_predictors.pt` and will be replayed during inference once enough samples have been seen.
+
 ```python
 from diffusers_helper.relationship_trainer import DiTTimestepResidualTrainer
 
@@ -616,6 +618,8 @@ with torch.no_grad():
 ### Timestep Modulation Replacement
 
 Freeze the DiT block and distill only its AdaLN/FiLM timestep MLP:
+
+> **UI shortcut:** pick `Relationship Trainer Mode = modulation` to let the demo capture timestep embeddings and train `DiTTimestepModulationTrainer` instances for every block. The predictors override AdaLayerNorm via `set_external_msa_modulation` so inference automatically substitutes γ̂/β̂ after each generation.
 
 ```python
 from diffusers_helper.relationship_trainer import DiTTimestepModulationTrainer
