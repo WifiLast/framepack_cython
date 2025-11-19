@@ -3005,6 +3005,7 @@ def worker(
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
 
             stream.output_queue.push(('file', output_filename))
+            # Persist caches after each video chunk is created.
             _persist_runtime_caches_on_exit()
 
             if is_last_section:
