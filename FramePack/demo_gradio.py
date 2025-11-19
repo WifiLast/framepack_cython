@@ -174,6 +174,7 @@ from diffusers_helper.cpu_opt import (
 )
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.models.hunyuan_video_packed import set_attention_accel_mode
+from diffusers_helper.relationship_trainer import HiddenStateRelationshipTrainer
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper import memory as memory_v1
 from diffusers_helper import memory_v2
@@ -2183,6 +2184,21 @@ else:
     CURRENT_KV_CACHE_ENABLED = False
 
 
+# Relationship Trainer (Experimental)
+RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = False
+relationship_trainer = None
+try:
+    # inner_dim of the transformer is num_attention_heads * attention_head_dim = 24 * 128 = 3072
+    relationship_trainer = HiddenStateRelationshipTrainer(hidden_dim=3072, device=cpu)
+    rt_state = _load_runtime_cache_state("relationship_trainer")
+    if rt_state:
+        relationship_trainer.load_state_dict(rt_state)
+        print('Loaded persisted relationship trainer state.')
+except Exception as e:
+    print(f"Warning: Could not initialize HiddenStateRelationshipTrainer: {e}")
+    relationship_trainer = None
+
+
 def _persist_runtime_caches_on_exit():
     if not RUNTIME_CACHE_ENABLED:
         return
@@ -2201,6 +2217,11 @@ def _persist_runtime_caches_on_exit():
         kv_manager = getattr(core, "kv_cache_manager", None)
         if kv_manager is not None:
             _save_runtime_cache_state("kv_cache", kv_manager.state_dict())
+    
+    # Persist the relationship trainer if it was used during the run
+    if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and relationship_trainer is not None:
+        print("Persisting relationship trainer state to disk...")
+        _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
 
 
 atexit.register(_persist_runtime_caches_on_exit)
@@ -2559,6 +2580,8 @@ def worker(
     quality_mode=False,
     use_tensorrt_decode=False,
     use_tensorrt_transformer=False,
+    use_relationship_trainer=False,
+    rt_learning_rate=1e-4,
 ):
     # Initialize profiling if enabled
     PROFILING_ENABLED = args.enable_profiling
@@ -2629,6 +2652,28 @@ def worker(
         transformer_backbone = getattr(transformer_impl, "transformer", None)
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer_impl)
+
+    # Setup for experimental relationship trainer
+    global RELATIONSHIP_TRAINER_ENABLED_FOR_RUN
+    RELATIONSHIP_TRAINER_ENABLED_FOR_RUN = use_relationship_trainer and relationship_trainer is not None
+    block_io_data = []
+
+    if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN:
+        print(f"Enabling Hidden State Trainer with LR={rt_learning_rate}.")
+        relationship_trainer.to(gpu)
+        # Re-initialize optimizer with the potentially new learning rate from the UI
+        relationship_trainer.optimizer = torch.optim.Adam(relationship_trainer.model.parameters(), lr=rt_learning_rate)
+        
+        def block_io_callback(block_id, block_type, input_h, output_h):
+            # The trainer learns to predict the residual (output - input)
+            residual = output_h - input_h
+            # Store on CPU to save VRAM
+            block_io_data.append((input_h.cpu(), residual.cpu()))
+
+        transformer_backbone.block_io_callback = block_io_callback
+    else:
+        if hasattr(transformer_backbone, 'block_io_callback'):
+            transformer_backbone.block_io_callback = None
 
     cache_event_recorder = CacheEventRecorder()
     cache_event_recorder.reset()
@@ -3010,6 +3055,33 @@ def worker(
 
             if is_last_section:
                 break
+
+    # After generation, run the training step if enabled
+    if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
+        print(f"\\nTraining relationship trainer on {len(block_io_data)} captured block I/O pairs...")
+        # Use a random subset of the collected data to keep training time reasonable
+        import random
+        sample_size = min(len(block_io_data), 256)
+        training_samples = random.sample(block_io_data, k=sample_size)
+        
+        total_loss = 0
+        # Re-enable gradients for this training step
+        with torch.enable_grad():
+            for i, (input_h, residual) in enumerate(training_samples):
+                loss = relationship_trainer.train_step(input_h, residual)
+                total_loss += loss
+                if (i + 1) % 64 == 0:
+                    print(f"  ... trained on {i+1}/{sample_size} samples")
+
+        avg_loss = total_loss / sample_size if sample_size > 0 else 0
+        print(f"Relationship trainer step finished. Average loss: {avg_loss:.6f}")
+        
+        # Persist the newly trained model immediately
+        print("Persisting relationship trainer state to disk...")
+        _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+
+        block_io_data.clear()
+
     except:
         traceback.print_exc()
         cache_event_recorder.cancel_chunk()
@@ -3022,6 +3094,10 @@ def worker(
 
     if hasattr(transformer_backbone, "set_cache_event_recorder"):
         transformer_backbone.set_cache_event_recorder(None)
+
+    # Clean up relationship trainer callback
+    if hasattr(transformer_backbone, 'block_io_callback'):
+        transformer_backbone.block_io_callback = None
 
     # Export profiling results if enabled
     if PROFILING_ENABLED:
@@ -3098,6 +3174,8 @@ def process(
     quality_mode,
     use_tensorrt_decode,
     use_tensorrt_transformer,
+    use_relationship_trainer,
+    rt_learning_rate,
 ):
     global stream
     assert input_image is not None, 'No input image!'
@@ -3130,6 +3208,8 @@ def process(
         quality_mode,
         use_tensorrt_decode,
         use_tensorrt_transformer,
+        use_relationship_trainer,
+        rt_learning_rate,
     )
 
     output_filename = None
@@ -3217,6 +3297,21 @@ with block:
                     info='Appends a slow-motion phrasing to your prompt to encourage smoother motion.',
                 )
 
+            with gr.Accordion("Experimental", open=False):
+                use_relationship_trainer = gr.Checkbox(
+                    label='Enable Hidden State Trainer (Experimental)', 
+                    value=False, 
+                    info='Continuously trains a model on block input/output relationships. May increase generation time.'
+                )
+                rt_learning_rate = gr.Slider(
+                    label="Trainer Learning Rate", 
+                    minimum=1e-6, 
+                    maximum=1e-3, 
+                    value=1e-4, 
+                    step=1e-6,
+                    info="Learning rate for the hidden state relationship trainer."
+                )
+
             with gr.Accordion("Sampler Controls", open=False):
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
@@ -3278,6 +3373,8 @@ with block:
         quality_mode,
         tensorrt_decode_checkbox,
         tensorrt_transformer_checkbox,
+        use_relationship_trainer,
+        rt_learning_rate,
     ]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, cache_timeline_md, start_button, end_button])
     end_button.click(fn=end_process)

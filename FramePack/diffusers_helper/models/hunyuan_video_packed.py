@@ -857,6 +857,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.kv_cache_enabled = False
         self.kv_cache_manager: Optional[KVCachingManager] = None
         self.cache_event_recorder: Optional[CacheEventRecorder] = None
+        self.block_io_callback = None
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -1324,6 +1325,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             temb,
             attention_mask,
             rope_freqs,
+            block_id=block_id,
+            block_type=block_type,
         )
         streaks[block_id] = 0
         self._update_similarity_cache(
@@ -1343,8 +1346,15 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         temb: torch.Tensor,
         attention_mask,
         rope_freqs,
+        block_id: int,
+        block_type: str,
     ):
-        return self.gradient_checkpointing_method(
+        input_hidden = None
+        if self.block_io_callback is not None:
+            # The callback gets detached tensors to avoid holding onto the graph.
+            input_hidden = hidden_states.detach()
+
+        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
             block,
             hidden_states,
             encoder_hidden_states,
@@ -1352,6 +1362,19 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             attention_mask,
             rope_freqs,
         )
+
+        if self.block_io_callback is not None and input_hidden is not None:
+            output_hidden = hidden_states.detach()
+            try:
+                # The callback should handle moving data to CPU/offloading if needed.
+                self.block_io_callback(block_id, block_type, input_hidden, output_hidden)
+            except Exception as e:
+                # Prevent a faulty callback from crashing the main generation process.
+                print(f"Warning: block_io_callback failed for block {block_type}:{block_id}: {e}")
+                # Disable the callback for the rest of the run to avoid repeated errors.
+                self.block_io_callback = None
+
+        return hidden_states, encoder_hidden_states
 
     def _update_similarity_cache(
         self,
