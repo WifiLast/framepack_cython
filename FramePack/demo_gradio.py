@@ -3056,31 +3056,31 @@ def worker(
             if is_last_section:
                 break
 
-    # After generation, run the training step if enabled
-    if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
-        print(f"\\nTraining relationship trainer on {len(block_io_data)} captured block I/O pairs...")
-        # Use a random subset of the collected data to keep training time reasonable
-        import random
-        sample_size = min(len(block_io_data), 256)
-        training_samples = random.sample(block_io_data, k=sample_size)
-        
-        total_loss = 0
-        # Re-enable gradients for this training step
-        with torch.enable_grad():
-            for i, (input_h, residual) in enumerate(training_samples):
-                loss = relationship_trainer.train_step(input_h, residual)
-                total_loss += loss
-                if (i + 1) % 64 == 0:
-                    print(f"  ... trained on {i+1}/{sample_size} samples")
+        # After generation, run the training step if enabled
+        if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
+            print(f"\\nTraining relationship trainer on {len(block_io_data)} captured block I/O pairs...")
+            # Use a random subset of the collected data to keep training time reasonable
+            import random
+            sample_size = min(len(block_io_data), 256)
+            training_samples = random.sample(block_io_data, k=sample_size)
+            
+            total_loss = 0
+            # Re-enable gradients for this training step
+            with torch.enable_grad():
+                for i, (input_h, residual) in enumerate(training_samples):
+                    loss = relationship_trainer.train_step(input_h, residual)
+                    total_loss += loss
+                    if (i + 1) % 64 == 0:
+                        print(f"  ... trained on {i+1}/{sample_size} samples")
 
-        avg_loss = total_loss / sample_size if sample_size > 0 else 0
-        print(f"Relationship trainer step finished. Average loss: {avg_loss:.6f}")
-        
-        # Persist the newly trained model immediately
-        print("Persisting relationship trainer state to disk...")
-        _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
+            avg_loss = total_loss / sample_size if sample_size > 0 else 0
+            print(f"Relationship trainer step finished. Average loss: {avg_loss:.6f}")
+            
+            # Persist the newly trained model immediately
+            print("Persisting relationship trainer state to disk...")
+            _save_runtime_cache_state("relationship_trainer", relationship_trainer.state_dict())
 
-        block_io_data.clear()
+            block_io_data.clear()
 
     except:
         traceback.print_exc()
