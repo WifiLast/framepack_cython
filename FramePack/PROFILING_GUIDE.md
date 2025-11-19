@@ -25,12 +25,17 @@ Profile-Guided Optimization helps you identify **real bottlenecks** in your Fram
 ```bash
 # Run with profiling enabled
 python FramePack/demo_gradio.py --enable-profiling
+
+# Or make it the default for your shell session
+FRAMEPACK_ENABLE_PROFILING=1 python FramePack/demo_gradio.py
 ```
 
 This collects:
 - ⏱️ Timing for each major operation
 - 📊 Iteration-by-iteration breakdown
 - 💾 Memory snapshots
+
+Profiling remains off unless you pass the flag or export `FRAMEPACK_ENABLE_PROFILING=1`, so normal runs stay lightweight.
 
 Results saved to: `./profiling_results/`
 

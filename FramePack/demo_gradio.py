@@ -1046,6 +1046,7 @@ torch.set_grad_enabled(False)
 DEFAULT_CACHE_MODE = os.environ.get("FRAMEPACK_MODULE_CACHE_MODE", "semantic").lower()
 SEMANTIC_CACHE_THRESHOLD = float(os.environ.get("FRAMEPACK_SEMANTIC_CACHE_THRESHOLD", "0.985"))
 SEMANTIC_CACHE_THRESHOLD = max(0.0, min(1.0, SEMANTIC_CACHE_THRESHOLD))
+DEFAULT_PROFILING_ENABLED = os.environ.get("FRAMEPACK_ENABLE_PROFILING", "0") == "1"
 
 
 parser = argparse.ArgumentParser()
@@ -1099,7 +1100,12 @@ parser.add_argument(
 parser.add_argument(
     "--enable-profiling",
     action="store_true",
-    help="Enable profile-guided optimization (PGO) to identify bottlenecks. Exports timing stats and PyTorch profiler traces.",
+    default=DEFAULT_PROFILING_ENABLED,
+    help=(
+        "Enable profile-guided optimization (PGO) to identify bottlenecks. "
+        "Exports timing stats and PyTorch profiler traces. "
+        "Set FRAMEPACK_ENABLE_PROFILING=1 to turn this on without the CLI flag."
+    ),
 )
 parser.add_argument(
     "--profiling-iterations",

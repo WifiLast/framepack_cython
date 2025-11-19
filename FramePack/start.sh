@@ -25,6 +25,8 @@ PYTORCH_ENABLE_MEM_EFFICIENT_SDP=0 PYTORCH_ENABLE_FLASH_SDP=0 FRAMEPACK_PRELOAD_
 # --tensorrt-text-encoders
 
 # FRAMEPACK_ENABLE_BETTERTRANSFORMER=1
---enable-profiling  --profiling-iterations 5 --profiling-output-dir ./my_profile
+
+# Optional profiling (disabled by default):
+#FRAMEPACK_ENABLE_PROFILING=1 python demo_gradio.py --enable-profiling --profiling-iterations 5 --profiling-output-dir ./my_profile
 
 python demo_gradio.py --fast-start --enable-tensorrt --tensorrt-transformer --use-memory-v2
