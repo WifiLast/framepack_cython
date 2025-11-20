@@ -94,14 +94,20 @@ def _load_runtime_cache_state(name: str):
 
 def _save_runtime_cache_state(name: str, state):
     if not RUNTIME_CACHE_ENABLED or state is None:
+        if state is None:
+            print(f'Info: runtime cache for "{name}" not saved because state is None.')
         return
     path = _runtime_cache_path(name)
     tmp_path = f"{path}.{os.getpid()}.tmp"
+    print(f'Attempting to save runtime cache for "{name}" to: {path}')
     try:
         torch.save(state, tmp_path)
         os.replace(tmp_path, path)
+        print(f'Successfully saved runtime cache for "{name}".')
     except Exception as exc:
-        print(f'Warning: failed to save runtime cache "{name}": {exc}')
+        print(f'ERROR: failed to save runtime cache for "{name}": {exc}')
+        import traceback
+        traceback.print_exc()
     finally:
         try:
             if os.path.exists(tmp_path):
