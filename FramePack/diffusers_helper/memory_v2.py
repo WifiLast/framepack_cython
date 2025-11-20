@@ -105,7 +105,7 @@ class DynamicSwapInstaller:
             return super(original_class, self).__getattr__(name)
 
         # Also need to ensure forward() is called with all kwargs properly
-        original_forward = original_class.forward
+        original_forward = module.forward
 
         def hacked_forward(self, *args, **kwargs):
             # Debug logging for LlamaModel specifically
@@ -122,7 +122,7 @@ class DynamicSwapInstaller:
                     self.config.output_hidden_states = True
                     print(f"DEBUG: Temporarily set config.output_hidden_states from {original_config_value} to True", file=sys.stderr)
 
-            result = original_forward(self, *args, **kwargs)
+            result = original_forward(*args, **kwargs)
 
             if 'LlamaModel' in original_class.__name__:
                 has_hs = hasattr(result, 'hidden_states')

@@ -3033,11 +3033,6 @@ def worker(
     if transformer_backbone is None:
         transformer_backbone = globals().get("TRANSFORMER_BACKBONE", transformer_impl)
 
-    # Uninstall the dynamic swap wrapper to allow for fresh patching.
-    if args.use_memory_v2 and hasattr(transformer_backbone, 'forge_backup_original_class'):
-        print("Temporarily uninstalling memory-v2 wrapper to apply relationship trainer patches...")
-        DynamicSwapInstaller.uninstall_model(transformer)
-
     # Setup for experimental relationship trainer
     normalized_trainer_mode = (relationship_trainer_mode or "off").lower()
     _configure_relationship_block_overrides(transformer_backbone, normalized_trainer_mode, gpu, rt_learning_rate)
@@ -3092,11 +3087,6 @@ def worker(
         transformer_backbone.block_io_callback = block_io_callback
     elif hasattr(transformer_backbone, "block_io_callback"):
         transformer_backbone.block_io_callback = None
-
-    # Re-install the wrapper after patching so it captures the new 'forward' methods.
-    if args.use_memory_v2:
-        print("Re-installing memory-v2 wrapper...")
-        DynamicSwapInstaller.install_model(transformer, device=gpu)
 
     cache_event_recorder = CacheEventRecorder()
     cache_event_recorder.reset()
