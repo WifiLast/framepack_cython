@@ -3085,8 +3085,18 @@ def worker(
                 block_io_data.pop(0)
 
         transformer_backbone.block_io_callback = block_io_callback
+        # Also set callback on transformer_impl if it's different (e.g., wrapped)
+        if transformer_impl is not transformer_backbone:
+            print(f"DEBUG: transformer_impl type = {type(transformer_impl).__name__}, transformer_backbone type = {type(transformer_backbone).__name__}")
+            if hasattr(transformer_impl, "block_io_callback"):
+                transformer_impl.block_io_callback = block_io_callback
+                print("DEBUG: Set block_io_callback on transformer_impl")
+            else:
+                print("WARNING: transformer_impl does not have block_io_callback attribute - callback may not be invoked!")
     elif hasattr(transformer_backbone, "block_io_callback"):
         transformer_backbone.block_io_callback = None
+        if transformer_impl is not transformer_backbone and hasattr(transformer_impl, "block_io_callback"):
+            transformer_impl.block_io_callback = None
 
     cache_event_recorder = CacheEventRecorder()
     cache_event_recorder.reset()
@@ -3470,6 +3480,10 @@ def worker(
                 break
 
         # After generation, run the training step if enabled
+        if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN:
+            print(f"\nDEBUG: Relationship trainer enabled, collected {len(block_io_data)} block I/O samples")
+            if not block_io_data:
+                print("WARNING: No block I/O data captured! Check if block_io_callback is being invoked.")
         if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN and block_io_data:
             with torch.inference_mode(False):
                 print(f"\nTraining {normalized_trainer_mode} relationship trainer on {len(block_io_data)} tuples...")
@@ -3535,6 +3549,8 @@ def worker(
     # Clean up relationship trainer callback
     if hasattr(transformer_backbone, 'block_io_callback'):
         transformer_backbone.block_io_callback = None
+    if transformer_impl is not transformer_backbone and hasattr(transformer_impl, 'block_io_callback'):
+        transformer_impl.block_io_callback = None
     if hasattr(transformer_backbone, "clear_block_overrides"):
         transformer_backbone.clear_block_overrides()
 
