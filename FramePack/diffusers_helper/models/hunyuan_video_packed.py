@@ -1304,6 +1304,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                 temb,
                 attention_mask,
                 rope_freqs,
+                block_id=block_id,
+                block_type=block_type,
             )
             self._update_similarity_cache(
                 block_type=block_type,
