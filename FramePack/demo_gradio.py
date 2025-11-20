@@ -3104,6 +3104,13 @@ def worker(
         transformer_backbone.set_cache_event_recorder(cache_event_recorder)
 
     desired_fb_cache_state = bool(use_fb_cache)
+    # Disable first block cache when relationship trainer is enabled
+    # because fbcache bypasses the block_io_callback mechanism
+    if RELATIONSHIP_TRAINER_ENABLED_FOR_RUN:
+        if desired_fb_cache_state:
+            print("NOTE: Disabling first-block cache for this job (incompatible with relationship trainer)")
+        desired_fb_cache_state = False
+
     global CURRENT_FBCACHE_ENABLED, CURRENT_SIM_CACHE_ENABLED, CURRENT_KV_CACHE_ENABLED
     if hasattr(transformer_backbone, "enable_first_block_cache") and desired_fb_cache_state != CURRENT_FBCACHE_ENABLED:
         transformer_backbone.enable_first_block_cache(
