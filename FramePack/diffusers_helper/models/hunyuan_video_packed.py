@@ -1459,10 +1459,10 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
             return
         if key is None:
             key = self._compute_sim_cache_key(hidden_states, encoder_hidden_states)
-        self.similarity_cache_manager.step()
+        step_index = self.similarity_cache_manager.step(block_type, block_id)
         cache = self.similarity_cache_manager.get(block_type, block_id)
-        cache.update(key, hidden_states, encoder_hidden_states, self.similarity_cache_manager.global_step)
-        self.similarity_cache_manager.prune()
+        cache.update(key, hidden_states, encoder_hidden_states, step_index)
+        self.similarity_cache_manager.prune(block_type, block_id)
 
     def _compute_sim_cache_key(
         self,
