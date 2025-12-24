@@ -1132,7 +1132,7 @@ parser.add_argument("--jit-mode", type=str, choices=['off', 'trace', 'script'], 
 parser.add_argument("--disable-fbcache", action='store_true')
 parser.add_argument("--disable-sim-cache", action='store_true')
 parser.add_argument("--disable-kv-cache", action='store_true')
-parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard"))
+parser.add_argument("--xformers-mode", type=str, choices=["off", "standard", "aggressive"], default=os.environ.get("FRAMEPACK_XFORMERS_MODE", "off"))
 parser.add_argument("--fast-start", action='store_true', help="Skip optional optimizations to reduce startup latency.")
 parser.add_argument("--use-memory-v2", action="store_true", help="Enable optimized memory_v2 backend (async streams, pinned memory, cached stats).")
 parser.add_argument(
@@ -1486,9 +1486,9 @@ ENABLE_KV_CACHE = (os.environ.get("FRAMEPACK_ENABLE_KV_CACHE", "0") == "1") and 
 CURRENT_KV_CACHE_ENABLED = ENABLE_KV_CACHE
 KV_CACHE_LENGTH = int(os.environ.get("FRAMEPACK_KV_CACHE_LEN", "4096"))
 KV_CACHE_VERBOSE = os.environ.get("FRAMEPACK_KV_CACHE_VERBOSE", "0") == "1"
-XFORMERS_MODE = (args.xformers_mode or os.environ.get("FRAMEPACK_XFORMERS_MODE", "standard")).lower()
+XFORMERS_MODE = (args.xformers_mode or os.environ.get("FRAMEPACK_XFORMERS_MODE", "off")).lower()
 if XFORMERS_MODE not in {"off", "standard", "aggressive"}:
-    XFORMERS_MODE = "standard"
+    XFORMERS_MODE = "off"
 if XFORMERS_MODE == "aggressive":
     os.environ["XFORMERS_ATTENTION_OP"] = "cutlass"
     os.environ["XFORMERS_FORCE_DISABLE_DROPOUT"] = "1"
@@ -2846,9 +2846,13 @@ transformer.requires_grad_(False)
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
     # Now works with ROCm via forward pre-hooks
+    import sys
+    print(f"DEBUG demo_gradio: Installing DynamicSwapInstaller (high_vram={high_vram}, USE_FSDP={USE_FSDP})", file=sys.stderr)
     if not USE_FSDP:
+        print(f"DEBUG demo_gradio: Installing on transformer {transformer.__class__.__name__}", file=sys.stderr)
         DynamicSwapInstaller.install_model(transformer, device=gpu)
     if not USE_BITSANDBYTES:
+        print(f"DEBUG demo_gradio: Installing on text_encoder {text_encoder.__class__.__name__}", file=sys.stderr)
         DynamicSwapInstaller.install_model(text_encoder, device=gpu)
 else:
     if not USE_BITSANDBYTES:

@@ -97,15 +97,33 @@ class DynamicSwapInstaller:
         # Also need to ensure forward() is called with all kwargs properly
         original_forward = original_class.forward
 
-        def hacked_forward(self, *args, **kwargs):
+        def hacked_forward(self, *args, **forward_kwargs):
             # Debug logging for LlamaModel specifically
             import sys
             if 'LlamaModel' in original_class.__name__:
-                print(f"DEBUG hacked_forward ({original_class.__name__}): kwargs = {list(kwargs.keys())}", file=sys.stderr)
-                print(f"DEBUG hacked_forward: output_hidden_states = {kwargs.get('output_hidden_states', 'NOT SET')}", file=sys.stderr)
+                print(f"DEBUG hacked_forward ({original_class.__name__}): kwargs = {list(forward_kwargs.keys())}", file=sys.stderr)
+                print(f"DEBUG hacked_forward: output_hidden_states = {forward_kwargs.get('output_hidden_states', 'NOT SET')}", file=sys.stderr)
                 print(f"DEBUG hacked_forward: config.output_hidden_states = {getattr(self.config, 'output_hidden_states', 'NO CONFIG')}", file=sys.stderr)
 
-            result = original_forward(self, *args, **kwargs)
+            # Move input tensors to target device
+            swap_kwargs = getattr(self, '_dynamic_swap_kwargs', kwargs)
+            device = swap_kwargs.get('device', None)
+            if device is not None:
+                def move_to_device(obj):
+                    if isinstance(obj, torch.Tensor):
+                        if obj.device != device:
+                            return obj.to(**swap_kwargs)
+                        return obj
+                    elif isinstance(obj, (tuple, list)):
+                        return type(obj)(move_to_device(item) for item in obj)
+                    elif isinstance(obj, dict):
+                        return {k: move_to_device(v) for k, v in obj.items()}
+                    return obj
+
+                args = move_to_device(args)
+                forward_kwargs = move_to_device(forward_kwargs)
+
+            result = original_forward(self, *args, **forward_kwargs)
 
             if 'LlamaModel' in original_class.__name__:
                 has_hs = hasattr(result, 'hidden_states')
